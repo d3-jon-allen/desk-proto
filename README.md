@@ -11,4 +11,7 @@ npm run dev
 
 Opens on [http://localhost:5177](http://localhost:5177).
 
-Try: open the TOR case → ask “How does this section look against other sections?” or “What are my signed lines for this treaty?” → desk view state changes; chat stays short.
+- **Desk** — attention home → case desk → agent view-state
+- **Gallery** — [http://localhost:5177/gallery.html](http://localhost:5177/gallery.html) — Insight widget variants + op catalog (simple Storybook stand-in)
+
+Try: open the TOR case → ask “What % of section ITD is the residual?” → chip → Add to desk → then “How does this residual compare to Allianz?” to upgrade the same insight card.

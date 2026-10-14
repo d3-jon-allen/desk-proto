@@ -18,6 +18,36 @@ export interface AttentionItem {
   objectId: string | null;
   /** Grouped wait rows collapse into one home card. */
   groupCount?: number;
+  /** When the item landed on the attention list (ISO). */
+  addedAt: string;
+}
+
+/** Higher = more urgent. */
+export const URGENCY_RANK: Record<AttentionKind, number> = {
+  resolve: 5,
+  chase: 4,
+  review: 3,
+  watch: 2,
+  wait: 1,
+};
+
+export type AttentionSort = 'urgency' | 'added';
+
+export function sortAttention(
+  items: readonly AttentionItem[],
+  mode: AttentionSort,
+): AttentionItem[] {
+  const copy = [...items];
+  if (mode === 'urgency') {
+    copy.sort((a, b) => {
+      const byKind = URGENCY_RANK[b.kind] - URGENCY_RANK[a.kind];
+      if (byKind !== 0) return byKind;
+      return b.addedAt.localeCompare(a.addedAt);
+    });
+  } else {
+    copy.sort((a, b) => b.addedAt.localeCompare(a.addedAt));
+  }
+  return copy;
 }
 
 export interface SectionRow {
@@ -55,6 +85,15 @@ export interface ContractRow {
   subjectPremium: string;
   cedingCommission: string;
   lossRatio: string;
+  /** Numeric LR for threshold filters. */
+  lossRatioPct: number;
+}
+
+/** Measure threshold applied to a view (e.g. loss ratio > 10). */
+export interface MeasureThreshold {
+  key: string;
+  op: '>' | '<' | '>=' | '<=';
+  value: number;
 }
 
 /** Statement ledger row — statement-history.ts grain. */
@@ -96,6 +135,8 @@ export interface ViewState {
   filtersByView: Record<ViewId, DimFilterMap>;
   /** Date-range controls when a date column is visible. */
   dateRangeByView: Record<ViewId, DateRange | null>;
+  /** Optional measure thresholds per view (e.g. lossRatio > 10). */
+  thresholdsByView: Record<ViewId, MeasureThreshold[]>;
 }
 
 export interface TreatyObject {
@@ -167,7 +208,19 @@ function contractFromSeed(seed: {
     subjectPremium: money(seed.currency, seed.subjectPremium),
     cedingCommission: money(seed.currency, commission),
     lossRatio: pct(seed.lossRatioPct, 1),
+    lossRatioPct: seed.lossRatioPct,
   };
+}
+
+export function thresholdAllows(thresholds: MeasureThreshold[], key: string, numeric: number): boolean {
+  for (const t of thresholds) {
+    if (t.key !== key) continue;
+    if (t.op === '>' && !(numeric > t.value)) return false;
+    if (t.op === '>=' && !(numeric >= t.value)) return false;
+    if (t.op === '<' && !(numeric < t.value)) return false;
+    if (t.op === '<=' && !(numeric <= t.value)) return false;
+  }
+  return true;
 }
 
 export const USER_NAME = 'Carol';
@@ -180,6 +233,7 @@ export const ATTENTION: AttentionItem[] = [
     title: 'TOR statement landed with a tie-out break',
     detail: 'Internal tie out by €40K on A - EU.',
     objectId: 'tor-qs-2025',
+    addedAt: '2025-02-09T08:40:00Z',
   },
   {
     id: 'rvi-chase',
@@ -187,6 +241,7 @@ export const ATTENTION: AttentionItem[] = [
     title: 'RVI statement overdue',
     detail: 'Awaited; expected by 28 May 2026, 18 days overdue.',
     objectId: null,
+    addedAt: '2025-02-07T14:20:00Z',
   },
   {
     id: 'art-review',
@@ -194,6 +249,7 @@ export const ATTENTION: AttentionItem[] = [
     title: 'ART commission trued up 43.70% → 44.20%',
     detail: 'Sliding-scale true-up as LR landed at 50%; net cash effect ~$1.15M.',
     objectId: null,
+    addedAt: '2025-02-09T07:15:00Z',
   },
   {
     id: 'pet-watch',
@@ -201,6 +257,7 @@ export const ATTENTION: AttentionItem[] = [
     title: 'PET near premium cap',
     detail: 'Premium at 83% of cap ($62.2M / $75M).',
     objectId: null,
+    addedAt: '2025-02-05T11:00:00Z',
   },
   {
     id: 'provisional-group',
@@ -209,6 +266,7 @@ export const ATTENTION: AttentionItem[] = [
     detail: 'HRA, JAF, MAL · ~60-day bordereaux lag for Q1 2026.',
     objectId: null,
     groupCount: 3,
+    addedAt: '2025-02-08T16:45:00Z',
   },
 ];
 
@@ -600,6 +658,23 @@ export const TREATIES: Record<string, TreatyObject> = {
       status: t.status,
     })),
   },
+  /** Slim stub for cross-object residual compare demos. */
+  'allianz-qs-2025': {
+    id: 'allianz-qs-2025',
+    label: 'Allianz · Quota share · 2025',
+    signedLineBlended: '29.73%',
+    settlement: 'Funds withheld',
+    period: 'Jul 1, 2025 – Jun 30, 2026',
+    residualNote: 'No open residual',
+    residualScale: 'Last statement tied within €1 tolerance',
+    sections: [
+      { section: 'A - US', status: 'Tied', itd: '$45,300,000', previous: '$45,300,000', due: '0' },
+      { section: 'C - EU', status: 'Tied', itd: '€12,000,000', previous: '€12,000,000', due: '0' },
+    ],
+    signedLines: [],
+    contracts: [],
+    statements: [],
+  },
 };
 
 export const KIND_LABEL: Record<AttentionKind, string> = {
@@ -664,6 +739,12 @@ function emptyDateRanges(): Record<ViewId, DateRange | null> {
   return out;
 }
 
+function emptyThresholds(): Record<ViewId, MeasureThreshold[]> {
+  const out = {} as Record<ViewId, MeasureThreshold[]>;
+  for (const v of TREATY_VIEW_CATALOG) out[v.id] = [];
+  return out;
+}
+
 export function defaultViewState(objectId: string): ViewState {
   const obj = TREATIES[objectId] ?? null;
   const open = obj?.sections.find((s) => s.status === 'Open');
@@ -676,5 +757,6 @@ export function defaultViewState(objectId: string): ViewState {
     columnsByView: defaultColumnsByView(),
     filtersByView: defaultFiltersForObject(obj),
     dateRangeByView: emptyDateRanges(),
+    thresholdsByView: emptyThresholds(),
   };
 }

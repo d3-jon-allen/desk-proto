@@ -5,17 +5,33 @@ import {
   TODAY,
   TREATIES,
   USER_NAME,
-  defaultViewState,
   dimensionValues,
+  sortAttention,
+  thresholdAllows,
   type AttentionItem,
+  type AttentionSort,
   type ContractRow,
   type DeskTab,
   type DimFilterMap,
+  type MeasureThreshold,
   type SignedLineRow,
   type StatementRow,
   type TreatyObject,
   type ViewState,
 } from './data.ts';
+import {
+  INSIGHT_RESIDUAL_ID,
+  cloneViewForTab,
+  createTableObject,
+  residualInsightPeers,
+  residualInsightTor,
+  type DeskLayout,
+  type DeskObject,
+  type DeskOp,
+  type InsightDeskObject,
+  type TableDeskObject,
+} from './desk.ts';
+import { renderInsightWidget } from './insight-render.ts';
 import {
   TREATY_VIEW_CATALOG,
   activeFilterFields,
@@ -23,21 +39,30 @@ import {
   isDimension,
   recipe,
   type FieldDef,
+  type FieldRole,
   type ViewId,
 } from './schema.ts';
+import { esc } from './util.ts';
 
 type Screen = 'home' | 'case';
-type ModalKind = 'settings' | null;
+type ModalKind = 'settings' | 'confirm-remove' | null;
+
+type MessagePart =
+  | { type: 'text'; text: string }
+  | { type: 'chip'; label: string; value: string; apply?: DeskOp };
 
 interface Message {
   role: 'agent' | 'user';
-  body: string;
+  parts: MessagePart[];
 }
 
 interface AppState {
   screen: Screen;
   caseId: string | null;
-  view: ViewState | null;
+  desk: DeskObject[];
+  layout: DeskLayout;
+  /** Table object targeted by settings / mutations. */
+  focusTableId: string | null;
   messages: Message[];
   draftOpen: boolean;
   saved: boolean;
@@ -45,29 +70,68 @@ interface AppState {
   flash: string | null;
   compose: string;
   modal: ModalKind;
-  /** Which catalog recipe is selected for column editing in settings. */
   settingsFocus: ViewId;
+  settingsQuery: string;
+  /** Typeahead list open (Slack-style: show on focus). */
+  settingsSearchOpen: boolean;
+  /** Panel pending removal confirmation. */
+  pendingRemoveId: string | null;
+  chatCollapsed: boolean;
+  homeSort: AttentionSort;
+  /** Open chip action menu in the thread (msg index + part index). */
+  chipMenu: { msg: number; part: number } | null;
+  demo: {
+    sawResidualPct: boolean;
+    sawCompare: boolean;
+    sawSplit: boolean;
+    sawEmpty: boolean;
+    sawThreshold: boolean;
+  };
 }
 
+const SUGGEST_RESIDUAL_PCT = 'What % of section ITD is the residual?';
+const SUGGEST_COMPARE = 'How does this residual compare to Allianz?';
+const SUGGEST_SPLIT = 'Show signed lines and contracts side by side';
+const SUGGEST_EMPTY = 'Only open sections that aren’t A - EU';
+const SUGGEST_THRESHOLD = 'Show contracts with loss ratio over 10%';
+const SUGGEST_JUST_TELL = 'Don’t change the desk — just tell me the residual %';
 const SUGGEST_PEERS = 'How does this section look against other sections?';
-const SUGGEST_LINES = 'What are my signed lines for this treaty?';
 const SUGGEST_DRAFT = 'Draft a query for the residual';
 
+function msg(role: Message['role'], text: string, chips: MessagePart[] = []): Message {
+  return { role, parts: [{ type: 'text', text }, ...chips] };
+}
+
+function userText(m: Message): string {
+  return m.parts
+    .filter((p): p is Extract<MessagePart, { type: 'text' }> => p.type === 'text')
+    .map((p) => p.text)
+    .join(' ');
+}
+
 function activeSuggestions(): string[] {
-  const view = state.view;
-  if (!view) return [SUGGEST_DRAFT];
+  if (!primaryTable()) return [SUGGEST_DRAFT];
+  const d = state.demo;
   const out: string[] = [];
-  if (!view.exploredPeers) out.push(SUGGEST_PEERS);
-  else if (!view.enabledViews.has('signed-lines')) out.push(SUGGEST_LINES);
-  else out.push(SUGGEST_LINES);
-  out.push(SUGGEST_DRAFT);
+  if (!d.sawResidualPct) out.push(SUGGEST_RESIDUAL_PCT);
+  else if (!d.sawCompare) out.push(SUGGEST_COMPARE);
+  else if (!d.sawSplit) out.push(SUGGEST_SPLIT);
+  else if (!d.sawEmpty) out.push(SUGGEST_EMPTY);
+  else if (!d.sawThreshold) out.push(SUGGEST_THRESHOLD);
+  else {
+    out.push(SUGGEST_JUST_TELL);
+    out.push(SUGGEST_PEERS);
+    out.push(SUGGEST_DRAFT);
+  }
   return out;
 }
 
 const state: AppState = {
   screen: 'home',
   caseId: null,
-  view: null,
+  desk: [],
+  layout: 'stack',
+  focusTableId: null,
   messages: [],
   draftOpen: false,
   saved: false,
@@ -76,7 +140,45 @@ const state: AppState = {
   compose: '',
   modal: null,
   settingsFocus: 'sections',
+  settingsQuery: '',
+  settingsSearchOpen: false,
+  pendingRemoveId: null,
+  chatCollapsed: false,
+  homeSort: 'urgency',
+  chipMenu: null,
+  demo: {
+    sawResidualPct: false,
+    sawCompare: false,
+    sawSplit: false,
+    sawEmpty: false,
+    sawThreshold: false,
+  },
 };
+
+function iconPanelSidebar(): string {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2"/>
+    <path d="M15.5 4.5v15"/>
+  </svg>`;
+}
+
+function iconSortUrgency(): string {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M4 7h10"/>
+    <path d="M4 12h7"/>
+    <path d="M4 17h4"/>
+    <path d="M17 6v12"/>
+    <path d="M14 15l3 3 3-3"/>
+  </svg>`;
+}
+
+function iconSortDate(): string {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="8"/>
+    <path d="M12 8v4.5l2.5 1.5"/>
+  </svg>`;
+}
+
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
@@ -84,127 +186,34 @@ function currentItem(): AttentionItem | null {
   return ATTENTION.find((a) => a.id === state.caseId) ?? null;
 }
 
-function currentObject(): TreatyObject | null {
-  const item = currentItem();
-  if (!item?.objectId) return null;
-  return TREATIES[item.objectId] ?? null;
+function primaryTable(): TableDeskObject | null {
+  const focused = state.desk.find(
+    (o): o is TableDeskObject => o.kind === 'table' && o.id === state.focusTableId,
+  );
+  if (focused) return focused;
+  return state.desk.find((o): o is TableDeskObject => o.kind === 'table') ?? null;
 }
 
-function openCase(item: AttentionItem): void {
-  if (!item.objectId) {
-    // Soft stub for non-wired cases
-    state.screen = 'case';
-    state.caseId = item.id;
-    state.view = null;
-    state.messages = [
-      {
-        role: 'agent',
-        body: `I can open ${item.title.split(' ')[0]} as a case, but this prototype only projects a display object for TOR. Try the resolve item.`,
-      },
-    ];
-    state.draftOpen = false;
-    state.saved = false;
-    render();
-    return;
-  }
-  state.screen = 'case';
-  state.caseId = item.id;
-  state.view = defaultViewState(item.objectId);
-  state.messages = [
-    {
-      role: 'agent',
-      body: "I've opened the TOR case and pinned the tie-out break on the desk. The residual sits on Due for A - EU.",
-    },
-  ];
-  state.draftOpen = false;
-  state.saved = false;
-  state.fullRecord = false;
-  state.flash = null;
-  state.modal = null;
-  state.settingsFocus = 'sections';
-  render();
+function tableById(id: string | undefined): TableDeskObject | null {
+  if (!id) return primaryTable();
+  return state.desk.find((o): o is TableDeskObject => o.kind === 'table' && o.id === id) ?? null;
 }
 
-function closeCase(): void {
-  state.screen = 'home';
-  state.caseId = null;
-  state.view = null;
-  state.messages = [];
-  state.draftOpen = false;
-  state.fullRecord = false;
-  state.flash = null;
-  state.modal = null;
-  state.settingsFocus = 'sections';
-  render();
+function treatyFor(table: TableDeskObject): TreatyObject | null {
+  return TREATIES[table.treatyId] ?? null;
 }
 
-function ensureDimFilter(viewId: ViewId, key: string): void {
-  if (!state.view) return;
-  const map = state.view.filtersByView[viewId];
-  if (map[key]?.size) return;
-  map[key] = new Set(dimensionValues(viewId, key, currentObject()));
+function patchTable(tableId: string, patch: Partial<TableDeskObject>): void {
+  state.desk = state.desk.map((o) =>
+    o.kind === 'table' && o.id === tableId ? { ...o, ...patch, view: patch.view ?? o.view } : o,
+  );
 }
 
-function toggleColumn(viewId: ViewId, key: string): void {
-  if (!state.view) return;
-  const next = new Set(state.view.columnsByView[viewId]);
-  const field = recipe(viewId).columns.find((c) => c.key === key);
-  if (next.has(key)) next.delete(key);
-  else {
-    next.add(key);
-    if (field && isDimension(field)) ensureDimFilter(viewId, key);
-  }
-  state.view = {
-    ...state.view,
-    columnsByView: { ...state.view.columnsByView, [viewId]: next },
-  };
-  render();
-}
-
-function toggleDimValue(viewId: ViewId, dim: string, value: string): void {
-  if (!state.view) return;
-  const prev = state.view.filtersByView[viewId][dim] ?? new Set<string>();
-  const next = new Set(prev);
-  if (next.has(value)) next.delete(value);
-  else next.add(value);
-  const filtersByView = {
-    ...state.view.filtersByView,
-    [viewId]: { ...state.view.filtersByView[viewId], [dim]: next },
-  };
-  state.view = { ...state.view, filtersByView };
-  render();
-}
-
-function facetAllows(filters: DimFilterMap, dim: string, value: string, columnOn: boolean): boolean {
-  if (!columnOn) return true;
-  const selected = filters[dim];
-  if (!selected) return true;
-  return selected.has(value);
-}
-
-function toggleViewEnabled(viewId: ViewId): void {
-  if (!state.view) return;
-  const enabled = new Set(state.view.enabledViews);
-  if (enabled.has(viewId)) {
-    if (enabled.size <= 1) return; // keep at least one recipe on the desk
-    enabled.delete(viewId);
-    // Stay on this recipe in settings (grayed); only move the desk tab if needed.
-    const deskTab = enabled.has(state.view.tab)
-      ? state.view.tab
-      : ([...enabled][0] as ViewId);
-    state.view = { ...state.view, enabledViews: enabled, tab: deskTab };
-    state.settingsFocus = viewId;
-  } else {
-    enabled.add(viewId);
-    state.view = { ...state.view, enabledViews: enabled };
-    state.settingsFocus = viewId;
-  }
-  render();
-}
-
-function setView(patch: Partial<ViewState>, flash?: string): void {
-  if (!state.view) return;
-  state.view = { ...state.view, ...patch };
+function patchTableView(tableId: string | undefined, viewPatch: Partial<ViewState>, flash?: string): void {
+  const table = tableById(tableId);
+  if (!table) return;
+  patchTable(table.id, { view: { ...table.view, ...viewPatch } });
+  state.focusTableId = table.id;
   state.flash = flash ?? null;
   render();
   if (flash) {
@@ -215,53 +224,473 @@ function setView(patch: Partial<ViewState>, flash?: string): void {
   }
 }
 
-function agentReply(userText: string): void {
-  const q = userText.trim().toLowerCase();
-  state.messages = [...state.messages, { role: 'user', body: userText.trim() }];
+function placeInsightOnDesk(insight: InsightDeskObject): void {
+  // Drop legacy math/compare ids if any linger from older sessions in memory.
+  const rest = state.desk.filter(
+    (o) =>
+      o.id !== insight.id &&
+      o.id !== 'math-residual-pct' &&
+      o.id !== 'compare-residual',
+  );
+  const primaryIdx = rest.findIndex((o) => o.kind === 'table' && !o.title);
+  if (primaryIdx === -1) {
+    state.desk = [...rest, insight];
+    return;
+  }
+  state.desk = [...rest.slice(0, primaryIdx + 1), insight, ...rest.slice(primaryIdx + 1)];
+}
 
-  if (!state.view || !currentObject()) {
+function applyDeskOp(op: DeskOp): void {
+  const table = tableById(op.tableId);
+  if (!table) return;
+  const obj = treatyFor(table);
+
+  if (op.type === 'highlight-residual') {
+    patchTableView(table.id, { tab: 'sections', highlightDue: true, section: 'A - EU' }, 'residual');
+    return;
+  }
+  if (op.type === 'show-residual-insight') {
+    const existing = state.desk.find(
+      (o): o is InsightDeskObject => o.kind === 'insight' && o.id === INSIGHT_RESIDUAL_ID,
+    );
+    // Peers intent expands; chip add keeps peer story if already on desk.
+    const next =
+      op.peers || (existing && existing.subjects.length > 1)
+        ? residualInsightPeers()
+        : residualInsightTor();
+    placeInsightOnDesk(next);
+    patchTable(table.id, {
+      view: {
+        ...table.view,
+        tab: 'sections',
+        highlightDue: true,
+        section: 'A - EU',
+      },
+    });
+    state.focusTableId = table.id;
+    state.chipMenu = null;
+    state.flash = 'residual';
+    render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
+    return;
+  }
+  if (op.type === 'clear-filters' || op.type === 'show-all') {
+    if (!obj) return;
+    const filtersByView = { ...table.view.filtersByView };
+    for (const viewId of Object.keys(filtersByView) as ViewId[]) {
+      const dims = filtersByView[viewId];
+      const next: DimFilterMap = {};
+      for (const key of Object.keys(dims)) {
+        next[key] = new Set(dimensionValues(viewId, key, obj));
+      }
+      filtersByView[viewId] = next;
+    }
+    const clearedThresholds = { ...table.view.thresholdsByView };
+    for (const k of Object.keys(clearedThresholds) as ViewId[]) {
+      clearedThresholds[k] = [];
+    }
+    patchTableView(table.id, {
+      section: null,
+      filtersByView,
+      thresholdsByView: clearedThresholds,
+    });
+    return;
+  }
+  if (op.type === 'set-threshold') {
+    const list = [...(table.view.thresholdsByView[op.viewId] ?? [])].filter((t) => t.key !== op.key);
+    list.push({ key: op.key, op: op.op, value: op.value });
+    const enabled = new Set(table.view.enabledViews);
+    enabled.add(op.viewId);
+    const cols = new Set(table.view.columnsByView[op.viewId]);
+    cols.add(op.key);
+    patchTableView(table.id, {
+      tab: op.viewId,
+      enabledViews: enabled,
+      columnsByView: { ...table.view.columnsByView, [op.viewId]: cols },
+      thresholdsByView: { ...table.view.thresholdsByView, [op.viewId]: list },
+      exploredPeers: true,
+    }, 'threshold');
+  }
+}
+
+function openCase(item: AttentionItem): void {
+  if (!item.objectId) {
+    state.screen = 'case';
+    state.caseId = item.id;
+    state.desk = [];
+    state.focusTableId = null;
+    state.messages = [
+      msg(
+        'agent',
+        `I can open ${item.title.split(' ')[0]} as a case, but this prototype only projects a display object for TOR. Try the resolve item.`,
+      ),
+    ];
+    state.draftOpen = false;
+    state.saved = false;
+    render();
+    return;
+  }
+  const table = createTableObject(item.objectId);
+  state.screen = 'case';
+  state.caseId = item.id;
+  state.desk = [table];
+  state.layout = 'stack';
+  state.focusTableId = table.id;
+  state.messages = [
+    msg(
+      'agent',
+      "I've opened the TOR case and pinned the tie-out break on the desk. The residual sits on Due for A - EU.",
+    ),
+  ];
+  state.draftOpen = false;
+  state.saved = false;
+  state.fullRecord = false;
+  state.flash = null;
+  state.modal = null;
+  state.settingsFocus = 'sections';
+  state.settingsQuery = '';
+  state.settingsSearchOpen = false;
+  state.pendingRemoveId = null;
+  state.chatCollapsed = false;
+  state.chipMenu = null;
+  state.demo = {
+    sawResidualPct: false,
+    sawCompare: false,
+    sawSplit: false,
+    sawEmpty: false,
+    sawThreshold: false,
+  };
+  render();
+}
+
+function closeCase(): void {
+  state.screen = 'home';
+  state.caseId = null;
+  state.desk = [];
+  state.focusTableId = null;
+  state.layout = 'stack';
+  state.messages = [];
+  state.draftOpen = false;
+  state.fullRecord = false;
+  state.flash = null;
+  state.modal = null;
+  state.settingsFocus = 'sections';
+  state.settingsQuery = '';
+  state.settingsSearchOpen = false;
+  state.pendingRemoveId = null;
+  state.chatCollapsed = false;
+  state.chipMenu = null;
+  render();
+}
+
+function tableCount(): number {
+  return state.desk.filter((o) => o.kind === 'table').length;
+}
+
+function requestRemovePanel(objectId: string): void {
+  const target = state.desk.find((o) => o.id === objectId);
+  if (!target) return;
+  if (target.kind === 'table' && tableCount() <= 1) return;
+  state.pendingRemoveId = objectId;
+  state.modal = 'confirm-remove';
+  render();
+}
+
+function confirmRemovePanel(): void {
+  const id = state.pendingRemoveId;
+  const target = id ? state.desk.find((o) => o.id === id) : null;
+  if (!id || !target || (target.kind === 'table' && tableCount() <= 1)) {
+    state.modal = null;
+    state.pendingRemoveId = null;
+    render();
+    return;
+  }
+  state.desk = state.desk.filter((o) => o.id !== id);
+  if (state.focusTableId === id) {
+    state.focusTableId = primaryTable()?.id ?? null;
+  }
+  const panes = state.desk.filter((o) => o.kind === 'table' && o.title);
+  state.layout = panes.length >= 2 ? 'split' : 'stack';
+  state.modal = null;
+  state.pendingRemoveId = null;
+  render();
+}
+
+function ensureDimFilter(table: TableDeskObject, viewId: ViewId, key: string): ViewState {
+  const map = { ...table.view.filtersByView[viewId] };
+  if (!map[key]?.size) {
+    map[key] = new Set(dimensionValues(viewId, key, treatyFor(table)));
+  }
+  return {
+    ...table.view,
+    filtersByView: { ...table.view.filtersByView, [viewId]: map },
+  };
+}
+
+function toggleColumn(viewId: ViewId, key: string): void {
+  const table = primaryTable();
+  if (!table) return;
+  const next = new Set(table.view.columnsByView[viewId]);
+  const field = recipe(viewId).columns.find((c) => c.key === key);
+  let view = table.view;
+  if (next.has(key)) next.delete(key);
+  else {
+    next.add(key);
+    if (field && isDimension(field)) view = ensureDimFilter({ ...table, view }, viewId, key);
+  }
+  patchTableView(table.id, {
+    ...view,
+    columnsByView: { ...view.columnsByView, [viewId]: next },
+  });
+}
+
+function toggleDimValue(viewId: ViewId, dim: string, value: string): void {
+  const table = primaryTable();
+  if (!table) return;
+  const prev = table.view.filtersByView[viewId][dim] ?? new Set<string>();
+  const next = new Set(prev);
+  if (next.has(value)) next.delete(value);
+  else next.add(value);
+  patchTableView(table.id, {
+    filtersByView: {
+      ...table.view.filtersByView,
+      [viewId]: { ...table.view.filtersByView[viewId], [dim]: next },
+    },
+  });
+}
+
+function toggleViewEnabled(viewId: ViewId): void {
+  const table = primaryTable();
+  if (!table) return;
+  const enabled = new Set(table.view.enabledViews);
+  if (enabled.has(viewId)) {
+    if (enabled.size <= 1) return;
+    enabled.delete(viewId);
+    const deskTab = enabled.has(table.view.tab) ? table.view.tab : ([...enabled][0] as ViewId);
+    patchTableView(table.id, { enabledViews: enabled, tab: deskTab });
+    state.settingsFocus = viewId;
+  } else {
+    enabled.add(viewId);
+    patchTableView(table.id, { enabledViews: enabled });
+    state.settingsFocus = viewId;
+  }
+}
+
+function facetAllows(filters: DimFilterMap, dim: string, value: string, columnOn: boolean): boolean {
+  if (!columnOn) return true;
+  const selected = filters[dim];
+  if (!selected) return true;
+  return selected.has(value);
+}
+
+function agentReply(userTextIn: string): void {
+  const q = userTextIn.trim().toLowerCase();
+  state.messages = [...state.messages, msg('user', userTextIn.trim())];
+  const table = primaryTable();
+
+  if (!table || !treatyFor(table)) {
     state.messages = [
       ...state.messages,
-      { role: 'agent', body: 'This case has no projected display object in the prototype yet.' },
+      msg('agent', 'This case has no projected display object in the prototype yet.'),
+    ];
+    render();
+    return;
+  }
+
+  const residualChip: MessagePart = {
+    type: 'chip',
+    label: 'Residual / section ITD',
+    value: '3.2%',
+    apply: { type: 'show-residual-insight', tableId: table.id },
+  };
+
+  if (
+    (q.includes('just tell') || q.includes("don't change") || q.includes('don’t change')) &&
+    (q.includes('residual') || q.includes('%') || q.includes('percent'))
+  ) {
+    state.demo.sawResidualPct = true;
+    state.messages = [
+      ...state.messages,
+      msg(
+        'agent',
+        '3.2% of A – EU section ITD (€40K / €1.24M). Desk unchanged — open the readout to pin it.',
+        [residualChip],
+      ),
+    ];
+    render();
+    return;
+  }
+
+  if (
+    (q.includes('residual') && (q.includes('%') || q.includes('percent') || q.includes('itd'))) ||
+    q.includes('what % of section')
+  ) {
+    state.demo.sawResidualPct = true;
+    applyDeskOp({ type: 'highlight-residual', tableId: table.id });
+    state.messages = [
+      ...state.messages,
+      msg(
+        'agent',
+        'Due is highlighted on A – EU. Open the readout to pin Residual / ITD on the desk.',
+        [residualChip],
+      ),
+    ];
+    render();
+    return;
+  }
+
+  if (q.includes('compare') && q.includes('allianz')) {
+    state.demo.sawCompare = true;
+    applyDeskOp({ type: 'show-residual-insight', tableId: table.id, peers: true });
+    state.messages = [
+      ...state.messages,
+      msg('agent', 'Pinned TOR and Allianz side by side on the desk.'),
+    ];
+    render();
+    return;
+  }
+
+  if (
+    (q.includes('signed line') && q.includes('contract')) ||
+    q.includes('side by side')
+  ) {
+    state.demo.sawSplit = true;
+    const base = table.view;
+    const lines = createTableObject(table.treatyId, {
+      id: 'table-signed-lines',
+      title: 'Signed lines',
+      view: cloneViewForTab(base, 'signed-lines'),
+    });
+    const contracts = createTableObject(table.treatyId, {
+      id: 'table-contracts',
+      title: 'Contracts',
+      view: cloneViewForTab(base, 'contracts'),
+    });
+    // Keep the original treaty panel; add panes below (avoid duplicates on re-ask).
+    // Do not enable signed-lines/contracts tabs on the QS object — those live as panes only.
+    const keep = state.desk.filter(
+      (o) => o.id !== 'table-signed-lines' && o.id !== 'table-contracts',
+    );
+    state.desk = [...keep, lines, contracts];
+    state.layout = 'split';
+    state.focusTableId = lines.id;
+    state.messages = [
+      ...state.messages,
+      msg(
+        'agent',
+        'Kept your sections panel and opened Signed lines and Contracts beside each other below. Remove any pane with ✕ next to the gear.',
+      ),
+    ];
+    render();
+    return;
+  }
+
+  if (
+    (q.includes('open') && (q.includes("aren't") || q.includes('aren’t') || q.includes('not'))) ||
+    (q.includes('only open') && q.includes('a -'))
+  ) {
+    state.demo.sawEmpty = true;
+    // Open-only + pin to a tied section → empty set (demo for recovery actions).
+    patchTableView(table.id, {
+      tab: 'sections',
+      section: 'B - UK',
+      filtersByView: {
+        ...table.view.filtersByView,
+        sections: { ...table.view.filtersByView.sections, status: new Set(['Open']) },
+      },
+      exploredPeers: true,
+    });
+    state.messages = [
+      ...state.messages,
+      msg(
+        'agent',
+        'Filtered to Open sections excluding A - EU — that set is empty. Use the empty-state actions to recover.',
+      ),
+    ];
+    render();
+    return;
+  }
+
+  if (
+    (q.includes('loss ratio') || q.includes('lr ')) &&
+    (q.includes('over') || q.includes('>') || q.includes('above') || q.includes('10'))
+  ) {
+    state.demo.sawThreshold = true;
+    // Collapse split back to one contracts-focused table for clarity
+    const contractsView = cloneViewForTab(table.view, 'contracts');
+    contractsView.columnsByView.contracts = new Set([
+      ...contractsView.columnsByView.contracts,
+      'lossRatio',
+    ]);
+    contractsView.thresholdsByView = {
+      ...contractsView.thresholdsByView,
+      contracts: [{ key: 'lossRatio', op: '>', value: 10 }],
+    };
+    const contractsTable = createTableObject(table.treatyId, {
+      id: 'table-tor-main',
+      view: contractsView,
+    });
+    state.desk = [
+      ...state.desk.filter((o) => o.kind === 'insight'),
+      contractsTable,
+    ];
+    state.layout = 'stack';
+    state.focusTableId = contractsTable.id;
+    state.messages = [
+      ...state.messages,
+      msg(
+        'agent',
+        'Contracts with loss ratio over 10% — threshold is on the desk. You can also add thresholds from the gear search.',
+        [
+          {
+            type: 'chip',
+            label: 'Filter',
+            value: 'LR > 10%',
+            apply: {
+              type: 'set-threshold',
+              viewId: 'contracts',
+              key: 'lossRatio',
+              op: '>',
+              value: 10,
+              tableId: contractsTable.id,
+            },
+          },
+        ],
+      ),
     ];
     render();
     return;
   }
 
   if (q.includes('other section') || q.includes('against other') || q.includes('peer')) {
-    setView(
-      { section: null, tab: 'sections', highlightDue: true, exploredPeers: true },
-      'section',
-    );
+    patchTableView(table.id, {
+      section: null,
+      tab: 'sections',
+      highlightDue: true,
+      exploredPeers: true,
+    }, 'section');
     state.messages = [
       ...state.messages,
-      {
-        role: 'agent',
-        body: 'Cleared the section filter — all nine sections on the desk. A - EU is the only open row.',
-      },
+      msg('agent', 'Cleared the section filter — all nine sections on the desk. A - EU is the only open row.'),
     ];
     render();
     return;
   }
 
   if (q.includes('signed line')) {
-    const enabled = new Set(state.view.enabledViews);
+    const enabled = new Set(table.view.enabledViews);
     enabled.add('signed-lines');
-    setView(
-      {
-        tab: 'signed-lines',
-        section: null,
-        exploredPeers: true,
-        enabledViews: enabled,
-      },
+    patchTableView(
+      table.id,
+      { tab: 'signed-lines', section: null, exploredPeers: true, enabledViews: enabled },
       'tab',
     );
     state.messages = [
       ...state.messages,
-      {
-        role: 'agent',
-        body: "I've turned on the Signed lines view for this treaty. Switch back to Sections anytime — or use the gear to show or hide catalog views.",
-      },
+      msg('agent', "I've turned on the Signed lines view for this treaty."),
     ];
     render();
     return;
@@ -271,32 +700,26 @@ function agentReply(userText: string): void {
     state.draftOpen = true;
     state.messages = [
       ...state.messages,
-      {
-        role: 'agent',
-        body: 'Draft is open below the desk actions — edit it or send when ready.',
-      },
+      msg('agent', 'Draft is open below the desk actions — edit it or send when ready.'),
     ];
     render();
     return;
   }
 
   if (q.includes('section') && (q.includes('a -') || q.includes('a–') || q.includes('eu'))) {
-    setView({ tab: 'sections', section: 'A - EU', highlightDue: true }, 'section');
-    state.messages = [
-      ...state.messages,
-      { role: 'agent', body: 'Scoped the sections table back to A - EU.' },
-    ];
+    patchTableView(table.id, { tab: 'sections', section: 'A - EU', highlightDue: true }, 'section');
+    state.messages = [...state.messages, msg('agent', 'Scoped the sections table back to A - EU.')];
     render();
     return;
   }
 
-  const next =
-    state.view && !state.view.exploredPeers
-      ? 'Try asking how this section looks against the others.'
-      : state.view && !state.view.enabledViews.has('signed-lines')
-        ? 'Try asking for signed lines, or draft a query.'
-        : 'I change the desk rather than paste numbers here.';
-  state.messages = [...state.messages, { role: 'agent', body: next }];
+  state.messages = [
+    ...state.messages,
+    msg(
+      'agent',
+      'Try a suggestion — residual %, Allianz compare, side-by-side tables, or a loss-ratio threshold.',
+    ),
+  ];
   render();
 }
 
@@ -306,18 +729,11 @@ function sendCompose(): void {
   state.compose = '';
   if (state.screen === 'home') {
     const tor = ATTENTION.find((a) => a.id === 'tor-fix')!;
-    if (text.toLowerCase().includes('tor') || text.toLowerCase().includes('tie')) {
-      openCase(tor);
-      return;
-    }
     openCase(tor);
     state.messages = [
       ...state.messages,
-      { role: 'user', body: text },
-      {
-        role: 'agent',
-        body: 'Opened the top resolve item so we have a desk to work on. Ask about sections or signed lines.',
-      },
+      msg('user', text),
+      msg('agent', 'Opened the top resolve item so we have a desk to work on.'),
     ];
     render();
     return;
@@ -325,16 +741,9 @@ function sendCompose(): void {
   agentReply(text);
 }
 
-function esc(s: string): string {
-  return s
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
-}
-
 function renderTopnav(): string {
   return `<nav class="topnav">
+    <a href="/gallery.html">Gallery</a>
     <a href="#">Marketplace</a>
     <a href="#">Community</a>
     <a href="#">Ask AI</a>
@@ -355,9 +764,11 @@ function renderCompose(opts: { placeholder?: string; variant?: 'home' | 'chat' }
 }
 
 function renderHome(): string {
-  const cards = ATTENTION.map((item) => {
-    const kind = KIND_LABEL[item.kind];
-    return `<button type="button" class="attention-card${kind ? '' : ' no-kind'}" data-open="${esc(item.id)}">
+  const sorted = sortAttention(ATTENTION, state.homeSort);
+  const cards = sorted
+    .map((item) => {
+      const kind = KIND_LABEL[item.kind];
+      return `<button type="button" class="attention-card${kind ? '' : ' no-kind'}" data-open="${esc(item.id)}">
       ${kind ? `<span class="kind">${esc(kind)}</span>` : ''}
       <span class="attention-copy">
         <h2>${esc(item.title)}</h2>
@@ -365,7 +776,13 @@ function renderHome(): string {
       </span>
       <span class="arrow-btn" aria-hidden="true">→</span>
     </button>`;
-  }).join('');
+    })
+    .join('');
+
+  const sortByUrgency = state.homeSort === 'urgency';
+  const sortLabel = sortByUrgency
+    ? 'Sorted by urgency — click to sort by date added'
+    : 'Sorted by date added — click to sort by urgency';
 
   return `${renderTopnav()}
     <main class="shell shell--home">
@@ -373,7 +790,12 @@ function renderHome(): string {
         <h1>Good morning, ${esc(USER_NAME)}</h1>
         <div class="date">${esc(TODAY)}</div>
       </header>
-      <p class="home-lead">Here are the items that need your attention today:</p>
+      <div class="home-lead-row">
+        <p class="home-lead">Here are the items that need your attention today:</p>
+        <button type="button" class="icon-btn home-sort-btn" data-action="toggle-home-sort" aria-label="${esc(sortLabel)}" title="${esc(sortLabel)}">
+          ${sortByUrgency ? iconSortUrgency() : iconSortDate()}
+        </button>
+      </div>
       <div class="attention-list">${cards}</div>
     </main>
     ${renderCompose()}`;
@@ -393,26 +815,120 @@ function signedCell(r: SignedLineRow, key: string): string {
   return esc(typeof v === 'string' ? v : '—');
 }
 
-function renderColumnChecks(
-  fields: FieldDef[],
-  selected: Set<string>,
-  viewId: ViewId,
-  disabled: boolean,
-): string {
-  return fields
-    .map(
-      (f) => `<label class="check-row${disabled ? ' is-disabled' : ''}">
-      <input type="checkbox" data-column-view="${esc(viewId)}" data-key="${esc(f.key)}" ${selected.has(f.key) ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
-      <span>${esc(f.label)}</span>
-    </label>`,
-    )
-    .join('');
+function renderEmptyState(colspan: number, tableId: string, noun: string): string {
+  return `<tr><td colspan="${colspan}" class="empty-cell">
+    <div class="empty-state">
+      <p class="empty-title">Nothing here matches those filters.</p>
+      <p class="empty-copy">No ${esc(noun)} made it through. Clear your filters to reset the view, or show everything and start fresh.</p>
+      <div class="empty-actions">
+        <button type="button" class="btn" data-empty-op="clear-filters" data-table-id="${esc(tableId)}">Clear filters</button>
+        <button type="button" class="btn primary" data-empty-op="show-all" data-table-id="${esc(tableId)}">Show all</button>
+      </div>
+    </div>
+  </td></tr>`;
 }
 
-function renderActiveModal(view: ViewState, obj: TreatyObject): string {
-  if (state.modal !== 'settings') return '';
-  const focus = state.settingsFocus;
+function roleHint(role: FieldRole): string {
+  if (role === 'dimension') return 'dimension';
+  if (role === 'date') return 'date';
+  if (role === 'measure') return 'measure';
+  return 'id';
+}
+
+function renderSettingsTypeahead(view: ViewState, focus: ViewId, disabled: boolean): string {
   const focused = recipe(focus);
+  const selected = view.columnsByView[focus];
+  const q = state.settingsQuery.trim().toLowerCase();
+  const thresholds = view.thresholdsByView[focus] ?? [];
+
+  const selectedRows = focused.columns
+    .filter((c) => selected.has(c.key))
+    .map(
+      (c) => `<div class="selected-chip">
+      <span>${esc(c.label)}</span>
+      <button type="button" class="selected-chip-x" data-column-view="${esc(focus)}" data-key="${esc(c.key)}" ${disabled ? 'disabled' : ''} aria-label="Remove ${esc(c.label)}">✕</button>
+    </div>`,
+    )
+    .join('');
+
+  const thresholdChips = thresholds
+    .map(
+      (t) => `<div class="selected-chip selected-chip--threshold">
+      <span>${esc(t.key)} ${esc(t.op)} ${t.value}</span>
+      <button type="button" class="selected-chip-x" data-remove-threshold="${esc(focus)}" data-threshold-key="${esc(t.key)}" ${disabled ? 'disabled' : ''} aria-label="Remove threshold">✕</button>
+    </div>`,
+    )
+    .join('');
+
+  const addable = focused.columns.filter((c) => {
+    if (selected.has(c.key)) return false;
+    if (!q) return true;
+    return c.label.toLowerCase().includes(q) || c.key.toLowerCase().includes(q);
+  });
+
+  const thresholdHint =
+    focus === 'contracts' &&
+    (!q || q.includes('loss') || q.includes('lr') || q.includes('threshold') || q.includes('10'))
+      ? `<button type="button" class="typeahead-item" data-add-threshold="${esc(focus)}" data-threshold-key="lossRatio" data-threshold-op=">" data-threshold-value="10" ${disabled ? 'disabled' : ''}>
+        <span>Filter: Loss ratio &gt; 10%</span>
+        <span class="typeahead-meta">threshold</span>
+      </button>`
+      : '';
+
+  const items =
+    addable
+      .map(
+        (c) => `<button type="button" class="typeahead-item" data-column-view="${esc(focus)}" data-key="${esc(c.key)}" data-add-column="1" ${disabled ? 'disabled' : ''}>
+        <span>${esc(c.label)}</span>
+        <span class="typeahead-meta">${esc(roleHint(c.role))}</span>
+      </button>`,
+      )
+      .join('') + thresholdHint;
+
+  const list =
+    state.settingsSearchOpen && !disabled
+      ? `<div class="typeahead-list" data-typeahead-list>${items || `<p class="typeahead-empty">No matches</p>`}</div>`
+      : '';
+
+  return `<div class="settings-selected">${selectedRows}${thresholdChips || ''}</div>
+    <div class="typeahead${state.settingsSearchOpen ? ' is-open' : ''}">
+      <label class="typeahead-label">
+        <span class="visually-hidden">Add column or filter</span>
+        <input type="search" class="typeahead-input" data-settings-query placeholder="Add column or filter…" value="${esc(state.settingsQuery)}" ${disabled ? 'disabled' : ''} autocomplete="off" />
+      </label>
+      ${list}
+    </div>`;
+}
+
+function renderConfirmRemoveModal(): string {
+  if (state.modal !== 'confirm-remove' || !state.pendingRemoveId) return '';
+  const panel = state.desk.find((o) => o.id === state.pendingRemoveId);
+  const label =
+    panel?.kind === 'table'
+      ? (panel.title ?? treatyFor(panel)?.label ?? 'this panel')
+      : panel?.kind === 'insight'
+        ? panel.title
+        : 'this panel';
+  return `<div class="modal-backdrop" data-action="close-modal">
+    <div class="modal-card modal-card--confirm" data-stop role="dialog" aria-label="Remove panel">
+      <div class="modal-head">
+        <h3>Remove panel?</h3>
+        <button type="button" class="icon-btn" data-action="close-modal" aria-label="Close">✕</button>
+      </div>
+      <p class="confirm-copy">Remove <strong>${esc(label)}</strong> from the desk? You can always ask the agent to bring it back.</p>
+      <div class="modal-foot">
+        <button type="button" class="btn" data-action="close-modal">Cancel</button>
+        <button type="button" class="btn primary" data-action="confirm-remove">Remove</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderActiveModal(table: TableDeskObject, obj: TreatyObject): string {
+  if (state.modal === 'confirm-remove') return renderConfirmRemoveModal();
+  if (state.modal !== 'settings') return '';
+  const view = table.view;
+  const focus = state.settingsFocus;
   const focusEnabled = view.enabledViews.has(focus);
   const tabChips = TREATY_VIEW_CATALOG.map((v) => {
     const on = view.enabledViews.has(v.id);
@@ -431,8 +947,8 @@ function renderActiveModal(view: ViewState, obj: TreatyObject): string {
       </div>
       <div class="catalog-tabs">${tabChips}</div>
       <div class="settings-body${focusEnabled ? '' : ' is-disabled'}">
-        <h4 class="check-group-title">Columns</h4>
-        <div class="check-list">${renderColumnChecks(focused.columns, view.columnsByView[focus], focus, !focusEnabled)}</div>
+        <h4 class="check-group-title">Columns & filters</h4>
+        ${renderSettingsTypeahead(view, focus, !focusEnabled)}
       </div>
       <div class="modal-foot">
         <button type="button" class="btn primary" data-action="close-modal">Apply</button>
@@ -478,7 +994,6 @@ function renderDateFacet(viewId: ViewId, field: FieldDef, view: ViewState): stri
   </div>`;
 }
 
-/** Case pin for sections — keeps the focused single-select alongside derived facets. */
 function renderSectionPin(obj: TreatyObject, view: ViewState): string {
   if (!view.columnsByView.sections.has('section')) return '';
   const sectionLabel = view.section
@@ -498,6 +1013,16 @@ function renderSectionPin(obj: TreatyObject, view: ViewState): string {
   </label>`;
 }
 
+function renderThresholdChips(viewId: ViewId, view: ViewState): string {
+  const list = view.thresholdsByView[viewId] ?? [];
+  return list
+    .map(
+      (t) =>
+        `<span class="threshold-chip${state.flash === 'threshold' ? ' agent-touched' : ''}">${esc(t.key)} ${esc(t.op)} ${t.value}${t.key === 'lossRatio' ? '%' : ''}</span>`,
+    )
+    .join('');
+}
+
 function renderFilterToolbar(viewId: ViewId, view: ViewState, obj: TreatyObject): string {
   const fields = activeFilterFields(viewId, view.columnsByView[viewId]);
   const parts: string[] = [];
@@ -506,16 +1031,26 @@ function renderFilterToolbar(viewId: ViewId, view: ViewState, obj: TreatyObject)
     if (pin) parts.push(pin);
   }
   for (const field of fields) {
-    // Section focus chip already covers case pin; skip section multi-facet on sections tab.
     if (viewId === 'sections' && field.key === 'section') continue;
     if (isDateField(field)) parts.push(renderDateFacet(viewId, field, view));
     else if (isDimension(field)) parts.push(renderDimFacet(viewId, field, view, obj));
   }
+  parts.push(renderThresholdChips(viewId, view));
   if (parts.length === 0) return '';
   return `<div class="table-toolbar">${parts.join('')}</div>`;
 }
 
-function renderSectionsTable(obj: TreatyObject, view: ViewState): string {
+function tdCell(html: string, className?: string): string {
+  const cls = className ? ` class="${esc(className)}"` : '';
+  return `<td${cls}><span class="cell-text">${html}</span></td>`;
+}
+
+function cellClass(role: FieldRole, extra?: string): string | undefined {
+  const parts = [role === 'measure' ? 'num' : '', extra ?? ''].filter(Boolean);
+  return parts.length ? parts.join(' ') : undefined;
+}
+
+function renderSectionsTable(obj: TreatyObject, view: ViewState, tableId: string): string {
   const colDefs = recipe('sections').columns;
   const cols = colDefs.filter((c) => view.columnsByView.sections.has(c.key));
   const filters = view.filtersByView.sections;
@@ -527,14 +1062,14 @@ function renderSectionsTable(obj: TreatyObject, view: ViewState): string {
 
   const body =
     rows.length === 0
-      ? `<tr><td colspan="${Math.max(cols.length, 1)}" class="empty-cell">No sections match these filters.</td></tr>`
+      ? renderEmptyState(Math.max(cols.length, 1), tableId, 'sections')
       : rows
           .map(
             (r) => `<tr class="${r.status === 'Open' ? 'open' : ''}">
       ${cols
         .map((c) => {
-          const em = c.key === 'due' && r.dueEmphasis && view.highlightDue ? ' class="em"' : '';
-          return `<td${em}>${sectionCell(r, c.key)}</td>`;
+          const em = c.key === 'due' && r.dueEmphasis && view.highlightDue ? 'em' : undefined;
+          return tdCell(sectionCell(r, c.key), cellClass(c.role, em));
         })
         .join('')}
     </tr>`,
@@ -551,7 +1086,8 @@ function renderSectionsTable(obj: TreatyObject, view: ViewState): string {
 }
 
 function contractCell(r: ContractRow, key: string): string {
-  return esc(r[key as keyof ContractRow] ?? '');
+  if (key === 'lossRatioPct') return esc(r.lossRatio);
+  return esc(r[key as keyof ContractRow]?.toString() ?? '');
 }
 
 function statementCell(r: StatementRow, key: string): string {
@@ -559,24 +1095,27 @@ function statementCell(r: StatementRow, key: string): string {
   return esc(r[key as keyof StatementRow] ?? '');
 }
 
-function renderContracts(obj: TreatyObject, view: ViewState): string {
+function renderContracts(obj: TreatyObject, view: ViewState, tableId: string): string {
   const colDefs = recipe('contracts').columns;
   const cols = colDefs.filter((c) => view.columnsByView.contracts.has(c.key));
   const filters = view.filtersByView.contracts;
   const visible = view.columnsByView.contracts;
+  const thresholds = view.thresholdsByView.contracts ?? [];
   const rows = obj.contracts.filter((r) => {
     if (!facetAllows(filters, 'reinsured', r.reinsured, visible.has('reinsured'))) return false;
     if (!facetAllows(filters, 'section', r.section, visible.has('section'))) return false;
     if (!facetAllows(filters, 'currency', r.currency, visible.has('currency'))) return false;
+    if (!thresholdAllows(thresholds, 'lossRatio', r.lossRatioPct)) return false;
     return true;
   });
 
   const body =
     rows.length === 0
-      ? `<tr><td colspan="${Math.max(cols.length, 1)}" class="empty-cell">No contracts match these filters.</td></tr>`
+      ? renderEmptyState(Math.max(cols.length, 1), tableId, 'contracts')
       : rows
           .map(
-            (r) => `<tr>${cols.map((c) => `<td>${contractCell(r, c.key)}</td>`).join('')}</tr>`,
+            (r) =>
+              `<tr>${cols.map((c) => tdCell(contractCell(r, c.key), cellClass(c.role))).join('')}</tr>`,
           )
           .join('');
 
@@ -596,7 +1135,7 @@ function inDateRange(iso: string, range: { from: string; to: string } | null): b
   return true;
 }
 
-function renderStatements(obj: TreatyObject, view: ViewState): string {
+function renderStatements(obj: TreatyObject, view: ViewState, tableId: string): string {
   const colDefs = recipe('statements').columns;
   const cols = colDefs.filter((c) => view.columnsByView.statements.has(c.key));
   const filters = view.filtersByView.statements;
@@ -619,10 +1158,11 @@ function renderStatements(obj: TreatyObject, view: ViewState): string {
 
   const body =
     rows.length === 0
-      ? `<tr><td colspan="${Math.max(cols.length, 1)}" class="empty-cell">No statements match these filters.</td></tr>`
+      ? renderEmptyState(Math.max(cols.length, 1), tableId, 'statements')
       : rows
           .map(
-            (r) => `<tr>${cols.map((c) => `<td>${statementCell(r, c.key)}</td>`).join('')}</tr>`,
+            (r) =>
+              `<tr>${cols.map((c) => tdCell(statementCell(r, c.key), cellClass(c.role))).join('')}</tr>`,
           )
           .join('');
 
@@ -635,7 +1175,7 @@ function renderStatements(obj: TreatyObject, view: ViewState): string {
     </div>`;
 }
 
-function renderSignedLines(obj: TreatyObject, view: ViewState): string {
+function renderSignedLines(obj: TreatyObject, view: ViewState, tableId: string): string {
   const colDefs = recipe('signed-lines').columns;
   const cols = colDefs.filter((c) => view.columnsByView['signed-lines'].has(c.key));
   const filters = view.filtersByView['signed-lines'];
@@ -649,12 +1189,11 @@ function renderSignedLines(obj: TreatyObject, view: ViewState): string {
 
   const body =
     rows.length === 0
-      ? `<tr><td colspan="${Math.max(cols.length, 1)}" class="empty-cell">No signed lines match these filters.</td></tr>`
+      ? renderEmptyState(Math.max(cols.length, 1), tableId, 'signed lines')
       : rows
           .map(
-            (r) => `<tr>
-      ${cols.map((c) => `<td>${signedCell(r, c.key)}</td>`).join('')}
-    </tr>`,
+            (r) =>
+              `<tr>${cols.map((c) => tdCell(signedCell(r, c.key), cellClass(c.role))).join('')}</tr>`,
           )
           .join('');
 
@@ -666,59 +1205,139 @@ function renderSignedLines(obj: TreatyObject, view: ViewState): string {
       </table>
     </div>`;
 }
-function renderDisplayObject(obj: TreatyObject, view: ViewState): string {
+
+function renderTableObject(table: TableDeskObject): string {
+  const obj = treatyFor(table);
+  if (!obj) {
+    return `<section class="display-object"><p class="residual">Unknown treaty.</p></section>`;
+  }
+  const view = table.view;
   const tab = view.tab;
-  return `<section class="display-object${state.flash === 'tab' ? ' agent-touched' : ''}">
+  const heading = table.title ?? obj.label;
+  const showChrome = !table.title;
+  const canRemove = tableCount() > 1;
+
+  const tableBody =
+    tab === 'sections'
+      ? renderSectionsTable(obj, view, table.id)
+      : tab === 'signed-lines'
+        ? renderSignedLines(obj, view, table.id)
+        : tab === 'contracts'
+          ? renderContracts(obj, view, table.id)
+          : renderStatements(obj, view, table.id);
+
+  return `<section class="display-object${state.flash === 'tab' || state.flash === 'residual' ? ' agent-touched' : ''}${table.title ? ' is-pane' : ''}" data-table-id="${esc(table.id)}">
     <div class="display-head">
       <div>
-        <h3>${esc(obj.label)}</h3>
-        <div class="pills">
-          <span class="pill">Signed line (blended) ${esc(obj.signedLineBlended)}</span>
+        <h3>${esc(heading)}</h3>
+        ${
+          showChrome
+            ? `<div class="pills">
+          <span class="pill">Signed line (blended) <span class="pill--num">${esc(obj.signedLineBlended)}</span></span>
           <span class="pill">Settlement: ${esc(obj.settlement)}</span>
           <span class="pill">${esc(obj.period)}</span>
-        </div>
+        </div>`
+            : `<div class="pills"><span class="pill">${esc(obj.label)}</span></div>`
+        }
       </div>
-      <button type="button" class="icon-btn" data-action="open-settings" aria-label="Table settings">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.2 7.2 0 0 0-1.62-.94l-.36-2.54A.48.48 0 0 0 14 2h-4a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.65 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.13.23.4.32.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.41.48.41h4c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.09.48 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"/>
-        </svg>
-      </button>
-    </div>
-    <div class="residual">
-      <strong>${esc(obj.residualNote)}</strong>
-      <span class="scale">${esc(obj.residualScale)}</span>
+      <div class="display-head-actions">
+        <button type="button" class="icon-btn" data-action="open-settings" data-table-id="${esc(table.id)}" aria-label="Table settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.2 7.2 0 0 0-1.62-.94l-.36-2.54A.48.48 0 0 0 14 2h-4a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.65 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.13.23.4.32.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.41.48.41h4c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.09.48 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"/>
+          </svg>
+        </button>
+        ${
+          canRemove
+            ? `<button type="button" class="icon-btn" data-action="request-remove" data-table-id="${esc(table.id)}" aria-label="Remove panel">✕</button>`
+            : ''
+        }
+      </div>
     </div>
     ${
-      view.enabledViews.size > 1
+      showChrome
+        ? `<div class="residual${state.flash === 'residual' ? ' agent-touched' : ''}">
+      <strong>${esc(obj.residualNote)}</strong>
+      <span class="scale">${esc(obj.residualScale)}</span>
+    </div>`
+        : ''
+    }
+    ${
+      !table.title && view.enabledViews.size > 1
         ? `<div class="view-tabs" role="tablist">
       ${TREATY_VIEW_CATALOG.filter((v) => view.enabledViews.has(v.id))
         .map(
           (v) =>
-            `<button type="button" role="tab" class="view-tab${tab === v.id ? ' active' : ''}" data-tab="${esc(v.id)}" aria-selected="${tab === v.id}">${esc(v.label)}</button>`,
+            `<button type="button" role="tab" class="view-tab${tab === v.id ? ' active' : ''}" data-tab="${esc(v.id)}" data-table-id="${esc(table.id)}" aria-selected="${tab === v.id}">${esc(v.label)}</button>`,
         )
         .join('')}
     </div>`
         : ''
     }
-    ${
-      tab === 'sections'
-        ? renderSectionsTable(obj, view)
-        : tab === 'signed-lines'
-          ? renderSignedLines(obj, view)
-          : tab === 'contracts'
-            ? renderContracts(obj, view)
-            : renderStatements(obj, view)
-    }
+    ${tableBody}
   </section>`;
 }
 
-function renderThread(): string {
-  const msgs = state.messages
-    .map((m) => `<div class="bubble ${m.role}">${esc(m.body)}</div>`)
-    .join('');
+function renderDeskObject(o: DeskObject): string {
+  if (o.kind === 'table') return renderTableObject(o);
+  return renderInsightWidget(o, {
+    flash: state.flash === 'residual',
+    showRemove: true,
+    interactiveLinks: true,
+  });
+}
 
+function renderDesk(): string {
+  if (state.desk.length === 0) {
+    return `<section class="display-object"><p class="residual">No projected display object for this item in the prototype.</p></section>`;
+  }
+  const mains = state.desk.filter(
+    (o) => o.kind === 'insight' || (o.kind === 'table' && !o.title),
+  );
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  const mainHtml = mains.map(renderDeskObject).join('');
+  const panesHtml =
+    panes.length > 0
+      ? `<div class="desk-split-row">${panes.map((o) => renderTableObject(o)).join('')}</div>`
+      : '';
+  return `<div class="desk-composition">${mainHtml}${panesHtml}</div>`;
+}
+
+function renderMessage(m: Message): string {
+  const msgIdx = state.messages.indexOf(m);
+  const inner = m.parts
+    .map((p, partIdx) => {
+      if (p.type === 'text') return `<span class="bubble-text">${esc(p.text)}</span>`;
+      const menuOpen =
+        state.chipMenu?.msg === msgIdx && state.chipMenu.part === partIdx;
+      const menu = menuOpen
+        ? `<div class="chip-menu" role="menu">
+            <button type="button" class="chip-menu-item" role="menuitem" data-chip-add-desk data-chip-msg="${msgIdx}" data-chip-part="${partIdx}">Add to desk</button>
+          </div>`
+        : '';
+      return `<span class="readout-chip-wrap">
+        <button type="button" class="readout-chip${menuOpen ? ' is-open' : ''}" data-chip-msg="${msgIdx}" data-chip-part="${partIdx}" aria-haspopup="menu" aria-expanded="${menuOpen}" title="Actions">
+          <span class="readout-chip-label">${esc(p.label)}</span>
+          <span class="readout-chip-value">${esc(p.value)}</span>
+        </button>
+        ${menu}
+      </span>`;
+    })
+    .join(' ');
+  return `<div class="bubble ${m.role}">${inner}</div>`;
+}
+
+function renderThread(): string {
+  if (state.chatCollapsed) {
+    return `<aside class="chat chat--collapsed" aria-label="Chat collapsed">
+      <button type="button" class="icon-btn chat-rail-btn" data-action="expand-chat" aria-label="Expand chat" title="Expand chat">
+        ${iconPanelSidebar()}
+      </button>
+    </aside>`;
+  }
+
+  const msgs = state.messages.map(renderMessage).join('');
   const used = new Set(
-    state.messages.filter((m) => m.role === 'user').map((m) => m.body.toLowerCase()),
+    state.messages.filter((m) => m.role === 'user').map((m) => userText(m).toLowerCase()),
   );
   const suggestions = activeSuggestions()
     .filter((s) => !used.has(s.toLowerCase()))
@@ -726,6 +1345,11 @@ function renderThread(): string {
     .join('');
 
   return `<aside class="chat">
+    <div class="chat-toolbar">
+      <button type="button" class="icon-btn chat-rail-btn" data-action="collapse-chat" aria-label="Collapse chat" title="Collapse chat">
+        ${iconPanelSidebar()}
+      </button>
+    </div>
     <div class="chat-panel">
       <div class="thread-messages">${msgs}</div>
       ${suggestions ? `<div class="suggestions">${suggestions}</div>` : ''}
@@ -736,13 +1360,9 @@ function renderThread(): string {
 
 function renderCase(): string {
   const item = currentItem();
-  const obj = currentObject();
   if (!item) return renderHome();
-
-  const deskBody =
-    obj && state.view
-      ? renderDisplayObject(obj, state.view)
-      : `<section class="display-object"><p class="residual">No projected display object for this item in the prototype.</p></section>`;
+  const table = primaryTable();
+  const obj = table ? treatyFor(table) : null;
 
   const draft = state.draftOpen
     ? `<div class="display-object">
@@ -759,22 +1379,26 @@ function renderCase(): string {
     ? `<div class="full-record" data-action="close-full">
         <div class="full-record-card" data-stop>
           <h2>${esc(obj?.label ?? 'Record')}</h2>
-          <p>Canonical host for this data object — same tabs and tables, full chrome. In product this would be the reinsurer detail route, scoped to the case’s treaty year.</p>
-          <ul>
-            <li>Sections · Signed lines · Statement · Controls</li>
-            <li>Desk view state can deep-link here (tab, section filter)</li>
-            <li>Escape from the projected instance, not a different object</li>
-          </ul>
+          <p>Canonical host for this data object — same tabs and tables, full chrome.</p>
           <button type="button" class="btn primary" data-action="close-full">Back to case desk</button>
         </div>
       </div>`
     : '';
 
-  return `<div class="case-page">${renderTopnav()}
+  const modals =
+    state.modal === 'confirm-remove'
+      ? renderConfirmRemoveModal()
+      : table && obj
+        ? renderActiveModal(table, obj)
+        : '';
+
+  return `<div class="case-page${state.chatCollapsed ? ' chat-collapsed' : ''}">${renderTopnav()}
     <main class="case-body">
       <div class="desk-stage">
         <section class="desk" aria-label="Desk">
-          <button type="button" class="all-issues" data-action="home">← All issues</button>
+          <div class="desk-rail-head">
+            <button type="button" class="all-issues" data-action="home">← All issues</button>
+          </div>
           <div class="desk-scroll">
             <div class="case-banner">
               <span class="kind">${esc(KIND_LABEL[item.kind] || 'Case')}</span>
@@ -783,7 +1407,7 @@ function renderCase(): string {
                 <span class="meta">${esc(item.detail)}</span>
               </div>
             </div>
-            ${deskBody}
+            ${renderDesk()}
             ${draft}
           </div>
           <div class="case-actions">
@@ -795,11 +1419,10 @@ function renderCase(): string {
       </div>
     </main>
     ${renderThread()}
-    ${state.view && obj ? renderActiveModal(state.view, obj) : ''}
+    ${modals}
     ${full}
   </div>`;
 }
-
 function render(): void {
   app.innerHTML = state.screen === 'home' ? renderHome() : renderCase();
   bind();
@@ -831,19 +1454,51 @@ function bind(): void {
     el.addEventListener('click', (e) => {
       const target = e.target as HTMLElement;
       if (action === 'close-modal') {
-        // Only the backdrop / explicit close controls dismiss — not bubbled card clicks.
         if (el.hasAttribute('data-stop')) return;
         if (target.closest('[data-stop]') && target.closest('[data-action="close-modal"]') !== el) {
           return;
         }
         if (el.classList.contains('modal-backdrop') && target !== el) return;
         state.modal = null;
+        state.settingsQuery = '';
+        state.settingsSearchOpen = false;
+        state.pendingRemoveId = null;
         render();
         return;
       }
       if (action === 'open-settings') {
+        const tid = el.dataset.tableId;
+        if (tid) state.focusTableId = tid;
         state.modal = 'settings';
-        if (state.view) state.settingsFocus = state.view.tab;
+        const t = primaryTable();
+        if (t) state.settingsFocus = t.view.tab;
+        state.settingsQuery = '';
+        state.settingsSearchOpen = false;
+        render();
+        return;
+      }
+      if (action === 'request-remove') {
+        e.stopPropagation();
+        const id = el.dataset.tableId;
+        if (id) requestRemovePanel(id);
+        return;
+      }
+      if (action === 'confirm-remove') {
+        confirmRemovePanel();
+        return;
+      }
+      if (action === 'collapse-chat') {
+        state.chatCollapsed = true;
+        render();
+        return;
+      }
+      if (action === 'expand-chat') {
+        state.chatCollapsed = false;
+        render();
+        return;
+      }
+      if (action === 'toggle-home-sort') {
+        state.homeSort = state.homeSort === 'urgency' ? 'added' : 'urgency';
         render();
         return;
       }
@@ -869,11 +1524,11 @@ function bind(): void {
         state.draftOpen = false;
         state.messages = [
           ...state.messages,
-          { role: 'user', body: 'Sent the query draft.' },
-          {
-            role: 'agent',
-            body: 'Marked under query. The case stays on the desk until a corrected statement re-lands, or you resolve with an outcome.',
-          },
+          msg('user', 'Sent the query draft.'),
+          msg(
+            'agent',
+            'Marked under query. The case stays on the desk until a corrected statement re-lands, or you resolve with an outcome.',
+          ),
         ];
         render();
       }
@@ -881,18 +1536,38 @@ function bind(): void {
         state.saved = true;
         render();
       }
+      if (action === 'section' && el instanceof HTMLSelectElement) {
+        /* handled below */
+      }
     });
   });
 
   app.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      setView({ tab: btn.dataset.tab as DeskTab });
+      const tid = btn.dataset.tableId;
+      if (tid) state.focusTableId = tid;
+      patchTableView(tid, { tab: btn.dataset.tab as DeskTab });
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>('[data-insight-op]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const op = btn.dataset.insightOp;
+      const table = primaryTable();
+      if (op === 'reveal-source' && table) {
+        applyDeskOp({ type: 'highlight-residual', tableId: table.id });
+        return;
+      }
+      if (op === 'draft-from-narrative') {
+        state.draftOpen = true;
+        render();
+      }
     });
   });
 
   const sectionSelect = app.querySelector<HTMLSelectElement>('[data-action="section"]');
   sectionSelect?.addEventListener('change', () => {
-    setView({ section: sectionSelect.value || null });
+    patchTableView(undefined, { section: sectionSelect.value || null });
   });
 
   app.querySelectorAll<HTMLInputElement>('[data-facet-view]').forEach((input) => {
@@ -907,23 +1582,98 @@ function bind(): void {
 
   app.querySelectorAll<HTMLInputElement>('[data-date-view]').forEach((input) => {
     input.addEventListener('change', () => {
-      if (!state.view) return;
+      const table = primaryTable();
+      if (!table) return;
       const viewId = input.dataset.dateView as ViewId;
       const bound = input.dataset.dateBound as 'from' | 'to';
-      const prev = state.view.dateRangeByView[viewId] ?? { from: '', to: '' };
+      const prev = table.view.dateRangeByView[viewId] ?? { from: '', to: '' };
       const next = { ...prev, [bound]: input.value };
-      state.view = {
-        ...state.view,
-        dateRangeByView: { ...state.view.dateRangeByView, [viewId]: next },
-      };
-      render();
+      patchTableView(table.id, {
+        dateRangeByView: { ...table.view.dateRangeByView, [viewId]: next },
+      });
     });
   });
 
-  app.querySelectorAll<HTMLInputElement>('[data-column-view]').forEach((input) => {
-    input.addEventListener('change', () => {
-      toggleColumn(input.dataset.columnView as ViewId, input.dataset.key!);
+  app.querySelectorAll<HTMLElement>('[data-add-column]').forEach((el) => {
+    el.addEventListener('mousedown', (e) => e.preventDefault());
+    el.addEventListener('click', () => {
+      const viewId = el.getAttribute('data-column-view') as ViewId;
+      const key = el.getAttribute('data-key')!;
+      const table = primaryTable();
+      if (!table || table.view.columnsByView[viewId].has(key)) return;
+      toggleColumn(viewId, key);
+      state.settingsSearchOpen = true;
     });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>('.selected-chip-x[data-key]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const viewId = btn.dataset.columnView as ViewId;
+      const key = btn.dataset.key!;
+      const table = primaryTable();
+      if (!table || !table.view.columnsByView[viewId].has(key)) return;
+      toggleColumn(viewId, key);
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>('[data-add-threshold]').forEach((btn) => {
+    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('click', () => {
+      applyDeskOp({
+        type: 'set-threshold',
+        viewId: btn.dataset.addThreshold as ViewId,
+        key: btn.dataset.thresholdKey!,
+        op: (btn.dataset.thresholdOp as MeasureThreshold['op']) ?? '>',
+        value: Number(btn.dataset.thresholdValue ?? 10),
+      });
+      state.modal = null;
+      state.settingsQuery = '';
+      state.settingsSearchOpen = false;
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>('[data-remove-threshold]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const table = primaryTable();
+      if (!table) return;
+      const viewId = btn.dataset.removeThreshold as ViewId;
+      const key = btn.dataset.thresholdKey!;
+      const list = (table.view.thresholdsByView[viewId] ?? []).filter((t) => t.key !== key);
+      patchTableView(table.id, {
+        thresholdsByView: { ...table.view.thresholdsByView, [viewId]: list },
+      });
+    });
+  });
+
+  const settingsQuery = app.querySelector<HTMLInputElement>('[data-settings-query]');
+  settingsQuery?.addEventListener('focus', () => {
+    if (!state.settingsSearchOpen) {
+      state.settingsSearchOpen = true;
+      const pos = settingsQuery.selectionStart;
+      render();
+      const again = app.querySelector<HTMLInputElement>('[data-settings-query]');
+      again?.focus();
+      if (pos != null) again?.setSelectionRange(pos, pos);
+    }
+  });
+  settingsQuery?.addEventListener('input', () => {
+    state.settingsQuery = settingsQuery.value;
+    state.settingsSearchOpen = true;
+    const pos = settingsQuery.selectionStart;
+    render();
+    const again = app.querySelector<HTMLInputElement>('[data-settings-query]');
+    again?.focus();
+    if (pos != null) again?.setSelectionRange(pos, pos);
+  });
+  settingsQuery?.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (!state.settingsSearchOpen) return;
+      // Keep open if focus moved into the list (mousedown on item).
+      const active = document.activeElement;
+      if (active?.closest?.('[data-typeahead-list]')) return;
+      state.settingsSearchOpen = false;
+      render();
+    }, 120);
   });
 
   app.querySelectorAll<HTMLInputElement>('[data-enable-view]').forEach((input) => {
@@ -941,6 +1691,7 @@ function bind(): void {
       const id = el.dataset.settingsFocus as ViewId;
       if (state.settingsFocus === id) return;
       state.settingsFocus = id;
+      state.settingsQuery = '';
       render();
     });
   });
@@ -950,6 +1701,61 @@ function bind(): void {
   app.querySelectorAll<HTMLButtonElement>('[data-suggest]').forEach((btn) => {
     btn.addEventListener('click', () => {
       agentReply(btn.dataset.suggest!);
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>('.readout-chip[data-chip-msg]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const mi = Number(btn.dataset.chipMsg);
+      const pi = Number(btn.dataset.chipPart);
+      if (state.chipMenu?.msg === mi && state.chipMenu.part === pi) {
+        state.chipMenu = null;
+      } else {
+        state.chipMenu = { msg: mi, part: pi };
+      }
+      render();
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>('[data-chip-add-desk]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const mi = Number(btn.dataset.chipMsg);
+      const pi = Number(btn.dataset.chipPart);
+      const part = state.messages[mi]?.parts[pi];
+      if (part?.type === 'chip' && part.apply) applyDeskOp(part.apply);
+      else state.chipMenu = null;
+      render();
+    });
+  });
+
+  if (state.chipMenu) {
+    const closeMenu = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (t.closest('.readout-chip-wrap')) return;
+      state.chipMenu = null;
+      render();
+    };
+    window.setTimeout(() => {
+      document.addEventListener('click', closeMenu, { once: true });
+    }, 0);
+  }
+
+  app.querySelectorAll<HTMLButtonElement>('[data-empty-op]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const op = btn.dataset.emptyOp as 'clear-filters' | 'show-all';
+      applyDeskOp({ type: op, tableId: btn.dataset.tableId });
+    });
+  });
+
+  app.querySelectorAll<HTMLElement>('[data-table-id].display-object').forEach((el) => {
+    el.addEventListener('click', () => {
+      const tid = el.getAttribute('data-table-id');
+      if (tid && tid !== state.focusTableId) {
+        state.focusTableId = tid;
+        render();
+      }
     });
   });
 }
