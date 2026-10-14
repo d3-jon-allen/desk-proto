@@ -9,6 +9,7 @@ import {
 } from './data.ts';
 import {
   cloneViewForTab,
+  createSectionObject,
   createTableObject,
   type TableDeskObject,
 } from './desk.ts';
@@ -24,6 +25,7 @@ import {
 import { renderInsightWidget } from './insight-render.ts';
 import { renderAttentionCard } from './issue-render.ts';
 import { renderObjectWidget } from './object-render.ts';
+import { renderSectionObject } from './section-render.ts';
 import { esc } from './util.ts';
 
 type GallerySectionId = 'issue' | 'object' | 'insight' | 'chip';
@@ -112,12 +114,24 @@ const SECTIONS: GallerySection[] = [
   {
     id: 'object',
     label: 'Object',
-    lead: 'Entity-tethered table card — tabs, filters, empty recovery, split panes.',
+    lead: 'Entity-tethered cards — section focus (light) or treaty table (collection).',
     stories: [
       {
+        id: 'object-section-focus',
+        title: 'Section focus',
+        blurb: 'Query resolved to one section — treaty becomes tags; measures as a strip.',
+        html: (() => {
+          const sectionObj = createSectionObject('tor-qs-2025', 'A - EU', {
+            highlightDue: true,
+          });
+          const row = TOR.sections.find((r) => r.section === 'A - EU')!;
+          return renderSectionObject(sectionObj, TOR, row);
+        })(),
+      },
+      {
         id: 'object-sections',
-        title: 'Sections · residual highlight',
-        blurb: 'Default TOR projection — full chrome, Due emphasized.',
+        title: 'Treaty · sections table',
+        blurb: 'Collection frame — full chrome, Due emphasized.',
         html: renderObjectStory(objectSections()),
       },
       {

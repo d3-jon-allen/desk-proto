@@ -5,6 +5,7 @@ import {
   TODAY,
   TREATIES,
   USER_NAME,
+  defaultViewState,
   dimensionValues,
   sortAttention,
   thresholdAllows,
@@ -22,6 +23,7 @@ import {
 import {
   INSIGHT_RESIDUAL_ID,
   cloneViewForTab,
+  createSectionObject,
   createTableObject,
   residualInsightPeers,
   residualInsightTor,
@@ -29,9 +31,11 @@ import {
   type DeskObject,
   type DeskOp,
   type InsightDeskObject,
+  type SectionDeskObject,
   type TableDeskObject,
 } from './desk.ts';
 import { renderInsightWidget } from './insight-render.ts';
+import { renderSectionObject } from './section-render.ts';
 import {
   TREATY_VIEW_CATALOG,
   activeFilterFields,
@@ -110,7 +114,7 @@ function userText(m: Message): string {
 }
 
 function activeSuggestions(): string[] {
-  if (!primaryTable()) return [SUGGEST_DRAFT];
+  if (!caseTreatyId()) return [SUGGEST_DRAFT];
   const d = state.demo;
   const out: string[] = [];
   if (!d.sawResidualPct) out.push(SUGGEST_RESIDUAL_PCT);
@@ -191,7 +195,15 @@ function primaryTable(): TableDeskObject | null {
     (o): o is TableDeskObject => o.kind === 'table' && o.id === state.focusTableId,
   );
   if (focused) return focused;
-  return state.desk.find((o): o is TableDeskObject => o.kind === 'table') ?? null;
+  return state.desk.find((o): o is TableDeskObject => o.kind === 'table' && !o.title) ?? null;
+}
+
+function primarySection(): SectionDeskObject | null {
+  return state.desk.find((o): o is SectionDeskObject => o.kind === 'section') ?? null;
+}
+
+function caseTreatyId(): string | null {
+  return primaryTable()?.treatyId ?? primarySection()?.treatyId ?? null;
 }
 
 function tableById(id: string | undefined): TableDeskObject | null {
@@ -201,6 +213,57 @@ function tableById(id: string | undefined): TableDeskObject | null {
 
 function treatyFor(table: TableDeskObject): TreatyObject | null {
   return TREATIES[table.treatyId] ?? null;
+}
+
+/** Swap the treaty collection frame for a single-section focus card. */
+function focusSectionOnDesk(
+  treatyId: string,
+  section: string,
+  opts?: { highlightDue?: boolean },
+): SectionDeskObject {
+  const sectionObj = createSectionObject(treatyId, section, {
+    highlightDue: opts?.highlightDue ?? true,
+  });
+  const insights = state.desk.filter((o): o is InsightDeskObject => o.kind === 'insight');
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  state.desk = [sectionObj, ...insights, ...panes];
+  state.focusTableId = null;
+  return sectionObj;
+}
+
+/** Promote section focus back to the treaty table (collection view). */
+function expandToTreatyTable(
+  treatyId: string,
+  viewPatch?: Partial<ViewState>,
+): TableDeskObject {
+  const existing = primaryTable();
+  if (existing) {
+    if (viewPatch) patchTable(existing.id, { view: { ...existing.view, ...viewPatch } });
+    state.desk = state.desk.filter((o) => o.kind !== 'section');
+    state.focusTableId = existing.id;
+    return existing;
+  }
+  const base = defaultViewState(treatyId);
+  const table = createTableObject(treatyId, {
+    view: viewPatch ? { ...base, ...viewPatch } : base,
+  });
+  const insights = state.desk.filter((o): o is InsightDeskObject => o.kind === 'insight');
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  state.desk = [table, ...insights, ...panes];
+  state.focusTableId = table.id;
+  return table;
+}
+
+/** Table for agent intents — expands section focus when the op needs a collection. */
+function requireTreatyTable(viewPatch?: Partial<ViewState>): TableDeskObject | null {
+  const tid = caseTreatyId();
+  if (!tid) return null;
+  if (primaryTable()) {
+    const t = primaryTable()!;
+    if (viewPatch) patchTable(t.id, { view: { ...t.view, ...viewPatch } });
+    return t;
+  }
+  return expandToTreatyTable(tid, viewPatch);
 }
 
 function patchTable(tableId: string, patch: Partial<TableDeskObject>): void {
@@ -232,7 +295,9 @@ function placeInsightOnDesk(insight: InsightDeskObject): void {
       o.id !== 'math-residual-pct' &&
       o.id !== 'compare-residual',
   );
-  const primaryIdx = rest.findIndex((o) => o.kind === 'table' && !o.title);
+  const primaryIdx = rest.findIndex(
+    (o) => o.kind === 'section' || (o.kind === 'table' && !o.title),
+  );
   if (primaryIdx === -1) {
     state.desk = [...rest, insight];
     return;
@@ -241,33 +306,51 @@ function placeInsightOnDesk(insight: InsightDeskObject): void {
 }
 
 function applyDeskOp(op: DeskOp): void {
-  const table = tableById(op.tableId);
-  if (!table) return;
-  const obj = treatyFor(table);
-
-  if (op.type === 'highlight-residual') {
-    patchTableView(table.id, { tab: 'sections', highlightDue: true, section: 'A - EU' }, 'residual');
+  if (op.type === 'focus-section') {
+    focusSectionOnDesk(op.treatyId, op.section, { highlightDue: op.highlightDue ?? true });
+    state.flash = 'residual';
+    render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
     return;
   }
+
+  if (op.type === 'highlight-residual') {
+    const tid = tableById(op.tableId)?.treatyId ?? caseTreatyId();
+    if (!tid) return;
+    focusSectionOnDesk(tid, 'A - EU', { highlightDue: true });
+    state.flash = 'residual';
+    render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
+    return;
+  }
+
   if (op.type === 'show-residual-insight') {
+    const tid = tableById(op.tableId)?.treatyId ?? caseTreatyId();
+    if (!tid) return;
     const existing = state.desk.find(
       (o): o is InsightDeskObject => o.kind === 'insight' && o.id === INSIGHT_RESIDUAL_ID,
     );
-    // Peers intent expands; chip add keeps peer story if already on desk.
     const next =
       op.peers || (existing && existing.subjects.length > 1)
         ? residualInsightPeers()
         : residualInsightTor();
-    placeInsightOnDesk(next);
-    patchTable(table.id, {
-      view: {
-        ...table.view,
+    if (op.peers) {
+      expandToTreatyTable(tid, {
         tab: 'sections',
         highlightDue: true,
-        section: 'A - EU',
-      },
-    });
-    state.focusTableId = table.id;
+        section: null,
+        exploredPeers: true,
+      });
+    } else {
+      focusSectionOnDesk(tid, 'A - EU', { highlightDue: true });
+    }
+    placeInsightOnDesk(next);
     state.chipMenu = null;
     state.flash = 'residual';
     render();
@@ -277,6 +360,10 @@ function applyDeskOp(op: DeskOp): void {
     }, 900);
     return;
   }
+
+  const table = tableById(op.tableId) ?? requireTreatyTable();
+  if (!table) return;
+  const obj = treatyFor(table);
   if (op.type === 'clear-filters' || op.type === 'show-all') {
     if (!obj) return;
     const filtersByView = { ...table.view.filtersByView };
@@ -390,10 +477,17 @@ function tableCount(): number {
   return state.desk.filter((o) => o.kind === 'table').length;
 }
 
+function mainObjectCount(): number {
+  return state.desk.filter(
+    (o) => o.kind === 'section' || (o.kind === 'table' && !o.title) || o.kind === 'insight',
+  ).length;
+}
+
 function requestRemovePanel(objectId: string): void {
   const target = state.desk.find((o) => o.id === objectId);
   if (!target) return;
-  if (target.kind === 'table' && tableCount() <= 1) return;
+  if (target.kind === 'table' && !target.title && tableCount() <= 1 && !primarySection()) return;
+  if (target.kind === 'section' && mainObjectCount() <= 1) return;
   state.pendingRemoveId = objectId;
   state.modal = 'confirm-remove';
   render();
@@ -402,7 +496,12 @@ function requestRemovePanel(objectId: string): void {
 function confirmRemovePanel(): void {
   const id = state.pendingRemoveId;
   const target = id ? state.desk.find((o) => o.id === id) : null;
-  if (!id || !target || (target.kind === 'table' && tableCount() <= 1)) {
+  const blocked =
+    !id ||
+    !target ||
+    (target.kind === 'table' && !target.title && tableCount() <= 1 && !primarySection()) ||
+    (target.kind === 'section' && mainObjectCount() <= 1);
+  if (blocked) {
     state.modal = null;
     state.pendingRemoveId = null;
     render();
@@ -489,9 +588,9 @@ function facetAllows(filters: DimFilterMap, dim: string, value: string, columnOn
 function agentReply(userTextIn: string): void {
   const q = userTextIn.trim().toLowerCase();
   state.messages = [...state.messages, msg('user', userTextIn.trim())];
-  const table = primaryTable();
+  const tid = caseTreatyId();
 
-  if (!table || !treatyFor(table)) {
+  if (!tid || !TREATIES[tid]) {
     state.messages = [
       ...state.messages,
       msg('agent', 'This case has no projected display object in the prototype yet.'),
@@ -504,7 +603,7 @@ function agentReply(userTextIn: string): void {
     type: 'chip',
     label: 'Residual / section ITD',
     value: '3.2%',
-    apply: { type: 'show-residual-insight', tableId: table.id },
+    apply: { type: 'show-residual-insight', tableId: primaryTable()?.id },
   };
 
   if (
@@ -529,12 +628,12 @@ function agentReply(userTextIn: string): void {
     q.includes('what % of section')
   ) {
     state.demo.sawResidualPct = true;
-    applyDeskOp({ type: 'highlight-residual', tableId: table.id });
+    applyDeskOp({ type: 'focus-section', treatyId: tid, section: 'A - EU', highlightDue: true });
     state.messages = [
       ...state.messages,
       msg(
         'agent',
-        'Due is highlighted on A – EU. Open the readout to pin Residual / ITD on the desk.',
+        'Focused the desk on section A – EU — treaty context is on the tags. Open the readout to pin Residual / ITD.',
         [residualChip],
       ),
     ];
@@ -544,7 +643,7 @@ function agentReply(userTextIn: string): void {
 
   if (q.includes('compare') && q.includes('allianz')) {
     state.demo.sawCompare = true;
-    applyDeskOp({ type: 'show-residual-insight', tableId: table.id, peers: true });
+    applyDeskOp({ type: 'show-residual-insight', tableId: primaryTable()?.id, peers: true });
     state.messages = [
       ...state.messages,
       msg('agent', 'Pinned TOR and Allianz side by side on the desk.'),
@@ -558,6 +657,7 @@ function agentReply(userTextIn: string): void {
     q.includes('side by side')
   ) {
     state.demo.sawSplit = true;
+    const table = requireTreatyTable()!;
     const base = table.view;
     const lines = createTableObject(table.treatyId, {
       id: 'table-signed-lines',
@@ -569,8 +669,7 @@ function agentReply(userTextIn: string): void {
       title: 'Contracts',
       view: cloneViewForTab(base, 'contracts'),
     });
-    // Keep the original treaty panel; add panes below (avoid duplicates on re-ask).
-    // Do not enable signed-lines/contracts tabs on the QS object — those live as panes only.
+    // Keep primary object (section or treaty); add panes below.
     const keep = state.desk.filter(
       (o) => o.id !== 'table-signed-lines' && o.id !== 'table-contracts',
     );
@@ -581,7 +680,7 @@ function agentReply(userTextIn: string): void {
       ...state.messages,
       msg(
         'agent',
-        'Kept your sections panel and opened Signed lines and Contracts beside each other below. Remove any pane with ✕ next to the gear.',
+        'Kept your focus object and opened Signed lines and Contracts beside each other below. Remove any pane with ✕ next to the gear.',
       ),
     ];
     render();
@@ -593,6 +692,7 @@ function agentReply(userTextIn: string): void {
     (q.includes('only open') && q.includes('a -'))
   ) {
     state.demo.sawEmpty = true;
+    const table = requireTreatyTable()!;
     // Open-only + pin to a tied section → empty set (demo for recovery actions).
     patchTableView(table.id, {
       tab: 'sections',
@@ -619,6 +719,7 @@ function agentReply(userTextIn: string): void {
     (q.includes('over') || q.includes('>') || q.includes('above') || q.includes('10'))
   ) {
     state.demo.sawThreshold = true;
+    const table = requireTreatyTable()!;
     // Collapse split back to one contracts-focused table for clarity
     const contractsView = cloneViewForTab(table.view, 'contracts');
     contractsView.columnsByView.contracts = new Set([
@@ -666,21 +767,31 @@ function agentReply(userTextIn: string): void {
   }
 
   if (q.includes('other section') || q.includes('against other') || q.includes('peer')) {
-    patchTableView(table.id, {
+    const table = expandToTreatyTable(tid, {
       section: null,
       tab: 'sections',
       highlightDue: true,
       exploredPeers: true,
-    }, 'section');
+    });
+    state.focusTableId = table.id;
+    state.flash = 'section';
     state.messages = [
       ...state.messages,
-      msg('agent', 'Cleared the section filter — all nine sections on the desk. A - EU is the only open row.'),
+      msg(
+        'agent',
+        'Zoomed out to the treaty — all nine sections on the desk. A – EU is the only open row.',
+      ),
     ];
     render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
     return;
   }
 
   if (q.includes('signed line')) {
+    const table = requireTreatyTable()!;
     const enabled = new Set(table.view.enabledViews);
     enabled.add('signed-lines');
     patchTableView(
@@ -707,8 +818,11 @@ function agentReply(userTextIn: string): void {
   }
 
   if (q.includes('section') && (q.includes('a -') || q.includes('a–') || q.includes('eu'))) {
-    patchTableView(table.id, { tab: 'sections', section: 'A - EU', highlightDue: true }, 'section');
-    state.messages = [...state.messages, msg('agent', 'Scoped the sections table back to A - EU.')];
+    applyDeskOp({ type: 'focus-section', treatyId: tid, section: 'A - EU', highlightDue: true });
+    state.messages = [
+      ...state.messages,
+      msg('agent', 'Focused the desk on section A – EU again.'),
+    ];
     render();
     return;
   }
@@ -906,9 +1020,11 @@ function renderConfirmRemoveModal(): string {
   const label =
     panel?.kind === 'table'
       ? (panel.title ?? treatyFor(panel)?.label ?? 'this panel')
-      : panel?.kind === 'insight'
-        ? panel.title
-        : 'this panel';
+      : panel?.kind === 'section'
+        ? `Section: ${panel.section.replace(' - ', ' – ')}`
+        : panel?.kind === 'insight'
+          ? panel.title
+          : 'this panel';
   return `<div class="modal-backdrop" data-action="close-modal">
     <div class="modal-card modal-card--confirm" data-stop role="dialog" aria-label="Remove panel">
       <div class="modal-head">
@@ -1277,8 +1393,24 @@ function renderTableObject(table: TableDeskObject): string {
   </section>`;
 }
 
+function renderSectionDeskObject(sectionObj: SectionDeskObject): string {
+  const treaty = TREATIES[sectionObj.treatyId];
+  if (!treaty) {
+    return `<section class="section-object"><p class="residual">Unknown treaty.</p></section>`;
+  }
+  const row = treaty.sections.find((r) => r.section === sectionObj.section);
+  if (!row) {
+    return `<section class="section-object"><p class="residual">Unknown section.</p></section>`;
+  }
+  return renderSectionObject(sectionObj, treaty, row, {
+    flash: state.flash === 'residual',
+    showRemove: mainObjectCount() > 1,
+  });
+}
+
 function renderDeskObject(o: DeskObject): string {
   if (o.kind === 'table') return renderTableObject(o);
+  if (o.kind === 'section') return renderSectionDeskObject(o);
   return renderInsightWidget(o, {
     flash: state.flash === 'residual',
     showRemove: true,
@@ -1291,7 +1423,7 @@ function renderDesk(): string {
     return `<section class="display-object"><p class="residual">No projected display object for this item in the prototype.</p></section>`;
   }
   const mains = state.desk.filter(
-    (o) => o.kind === 'insight' || (o.kind === 'table' && !o.title),
+    (o) => o.kind === 'insight' || o.kind === 'section' || (o.kind === 'table' && !o.title),
   );
   const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
   const mainHtml = mains.map(renderDeskObject).join('');
@@ -1362,7 +1494,8 @@ function renderCase(): string {
   const item = currentItem();
   if (!item) return renderHome();
   const table = primaryTable();
-  const obj = table ? treatyFor(table) : null;
+  const tid = caseTreatyId();
+  const obj = tid ? TREATIES[tid] ?? null : null;
 
   const draft = state.draftOpen
     ? `<div class="display-object">
