@@ -45,6 +45,8 @@ export type CalcPart =
 
 export interface CalculationBlock {
   type: 'calculation';
+  /** `row` = Due ÷ ITD = Share. `sum` = stacked addends → total (PDF residual metrics-1). */
+  layout?: 'row' | 'sum';
   parts: CalcPart[];
 }
 
@@ -142,7 +144,7 @@ const DEFAULT_OPS: InsightOpType[] = [
   'draft-from-narrative',
 ];
 
-function residualCalc(due: string, itd: string, share: string): CalculationBlock {
+export function residualCalc(due: string, itd: string, share: string): CalculationBlock {
   return {
     type: 'calculation',
     parts: [
@@ -156,6 +158,32 @@ function residualCalc(due: string, itd: string, share: string): CalculationBlock
       },
       { kind: 'op', symbol: '=' },
       { kind: 'term', label: 'Share', value: share, role: 'output' },
+    ],
+  };
+}
+
+/** Canonical TOR residual equation — shared by chat readout and desk pin. */
+export function residualTorCalculation(): CalculationBlock {
+  return residualCalc('€40K', '€1.24M', '3.2%');
+}
+
+/** Vertical ITD rollup — gallery / optional chat (Residual metrics-1.pdf). */
+export function residualItdSumCalculation(count = 5, each = '€1.24M', total = '6.20M'): CalculationBlock {
+  const addends: CalcPart[] = Array.from({ length: count - 1 }, () => ({
+    kind: 'term' as const,
+    label: 'ITD',
+    value: each,
+    role: 'input' as const,
+  }));
+  return {
+    type: 'calculation',
+    layout: 'sum',
+    parts: [
+      ...addends,
+      { kind: 'op', symbol: '+' },
+      { kind: 'term', label: 'ITD', value: each, role: 'input' },
+      { kind: 'op', symbol: '=' },
+      { kind: 'term', label: 'Total ITD', value: total, role: 'output' },
     ],
   };
 }
@@ -174,7 +202,7 @@ export function residualInsightTor(): InsightWidget {
         entityId: 'tor-qs-2025',
         status: 'Open · A – EU',
         emphasis: true,
-        blocks: [residualCalc('€40K', '€1.24M', '3.2%')],
+        blocks: [residualTorCalculation()],
       },
     ],
     blocks: [],
@@ -196,7 +224,7 @@ export function residualInsightPeers(): InsightWidget {
         entityId: 'tor-qs-2025',
         status: 'Open · A – EU',
         emphasis: true,
-        blocks: [residualCalc('€40K', '€1.24M', '3.2%')],
+        blocks: [residualTorCalculation()],
       },
       {
         id: 'allianz',

@@ -662,12 +662,19 @@ export const TREATIES: Record<string, TreatyObject> = {
   'allianz-qs-2025': {
     id: 'allianz-qs-2025',
     label: 'Allianz · Quota share · 2025',
-    signedLineBlended: '29.73%',
+    signedLineBlended: '31.10%',
     settlement: 'Funds withheld',
     period: 'Jul 1, 2025 – Jun 30, 2026',
     residualNote: 'No open residual',
     residualScale: 'Last statement tied within €1 tolerance',
     sections: [
+      {
+        section: 'A - EU',
+        status: 'Tied',
+        itd: '€2,100,000',
+        previous: '€2,100,000',
+        due: '0',
+      },
       { section: 'A - US', status: 'Tied', itd: '$45,300,000', previous: '$45,300,000', due: '0' },
       { section: 'C - EU', status: 'Tied', itd: '€12,000,000', previous: '€12,000,000', due: '0' },
     ],

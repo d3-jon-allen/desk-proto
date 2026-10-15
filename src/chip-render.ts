@@ -1,3 +1,5 @@
+import type { CalculationBlock } from './insight.ts';
+import { renderCalculationBlock } from './insight-render.ts';
 import { esc } from './util.ts';
 
 export interface ReadoutChipModel {
@@ -52,5 +54,32 @@ export function renderReadoutChipInBubble(
   return `<div class="bubble agent">
     <span class="bubble-text">${esc(text)}</span>
     ${renderReadoutChip(chip, opts)}
+  </div>`;
+}
+
+/** Horizontal residual metrics chip (Due ÷ ITD = Share) for chat / gallery. */
+export function renderCalcChip(calc: CalculationBlock, opts: ReadoutChipOptions = {}): string {
+  const menuOpen = opts.menuOpen === true;
+  const menu = menuOpen
+    ? `<div class="chip-menu" role="menu">
+        <button type="button" class="chip-menu-item" role="menuitem" disabled>Add to desk</button>
+      </div>`
+    : '';
+  return `<span class="readout-chip-wrap chat-calc-wrap">
+    <button type="button" class="chat-calc-chip${menuOpen ? ' is-open' : ''}" aria-haspopup="menu" aria-expanded="${menuOpen}" title="Actions">
+      ${renderCalculationBlock(calc, { compact: true })}
+    </button>
+    ${menu}
+  </span>`;
+}
+
+export function renderCalcChipInBubble(
+  text: string,
+  calc: CalculationBlock,
+  opts: ReadoutChipOptions = {},
+): string {
+  return `<div class="bubble agent">
+    <span class="bubble-text">${esc(text)}</span>
+    ${renderCalcChip(calc, opts)}
   </div>`;
 }
