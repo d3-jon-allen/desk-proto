@@ -5,6 +5,7 @@ import {
   TODAY,
   TREATIES,
   USER_NAME,
+  defaultViewState,
   dimensionValues,
   sortAttention,
   thresholdAllows,
@@ -21,17 +22,19 @@ import {
 } from './data.ts';
 import {
   INSIGHT_RESIDUAL_ID,
-  cloneViewForTab,
+  createSectionObject,
   createTableObject,
-  residualInsightPeers,
   residualInsightTor,
   type DeskLayout,
   type DeskObject,
   type DeskOp,
   type InsightDeskObject,
+  type SectionDeskObject,
   type TableDeskObject,
 } from './desk.ts';
-import { renderInsightWidget } from './insight-render.ts';
+import { residualTorCalculation, type CalculationBlock } from './insight.ts';
+import { renderCalculationBlock, renderInsightWidget } from './insight-render.ts';
+import { renderSectionObject } from './section-render.ts';
 import {
   TREATY_VIEW_CATALOG,
   activeFilterFields,
@@ -44,11 +47,13 @@ import {
 } from './schema.ts';
 import { esc } from './util.ts';
 
-type Screen = 'home' | 'case';
+type DeskMode = 'roster' | 'focus';
 type ModalKind = 'settings' | 'confirm-remove' | null;
+type DrawerRange = 'today' | 'week' | 'last-week' | 'month' | 'custom';
 
 type MessagePart =
   | { type: 'text'; text: string }
+  | { type: 'calc'; calc: CalculationBlock; apply?: DeskOp }
   | { type: 'chip'; label: string; value: string; apply?: DeskOp };
 
 interface Message {
@@ -56,8 +61,25 @@ interface Message {
   parts: MessagePart[];
 }
 
+/** One parked issue’s working set — desk objects + draft + demo progress. */
+interface DrawerCluster {
+  caseId: string;
+  title: string;
+  detail: string;
+  kind: AttentionItem['kind'];
+  desk: DeskObject[];
+  layout: DeskLayout;
+  focusTableId: string | null;
+  draftOpen: boolean;
+  draftSent: boolean;
+  draftBody: string;
+  demo: AppState['demo'];
+  updatedAt: number;
+}
+
 interface AppState {
-  screen: Screen;
+  /** Roster (all open issues) or one focused issue — same desk, chat never leaves. */
+  deskMode: DeskMode;
   caseId: string | null;
   desk: DeskObject[];
   layout: DeskLayout;
@@ -65,7 +87,9 @@ interface AppState {
   focusTableId: string | null;
   messages: Message[];
   draftOpen: boolean;
-  saved: boolean;
+  /** Draft stays visible after send with a sent affordance. */
+  draftSent: boolean;
+  draftBody: string;
   fullRecord: boolean;
   flash: string | null;
   compose: string;
@@ -80,26 +104,45 @@ interface AppState {
   homeSort: AttentionSort;
   /** Open chip action menu in the thread (msg index + part index). */
   chipMenu: { msg: number; part: number } | null;
+  /** Transient toast (e.g. dismiss draft with undo). */
+  toast: { id: number; message: string } | null;
+  /** Snapshot for undo after dismissing the draft widget. */
+  draftUndo: { body: string; sent: boolean } | null;
+  /** Parked issue clusters (metal tray). */
+  drawer: DrawerCluster[];
+  /** Drawer dropdown open under the toggle. */
+  drawerOpen: boolean;
+  /** Time filter for drawer list. */
+  drawerRange: DrawerRange;
+  drawerCustomFrom: string;
+  drawerCustomTo: string;
+  /** Multi-select for bulk clear. */
+  drawerSelected: string[];
   demo: {
     sawResidualPct: boolean;
-    sawCompare: boolean;
-    sawSplit: boolean;
-    sawEmpty: boolean;
-    sawThreshold: boolean;
+    sawZoomOut: boolean;
+    sawDraft: boolean;
+    sawPortfolio: boolean;
   };
 }
 
+const SUGGEST_OPEN_TOR = 'Open the TOR resolve item';
 const SUGGEST_RESIDUAL_PCT = 'What % of section ITD is the residual?';
-const SUGGEST_COMPARE = 'How does this residual compare to Allianz?';
-const SUGGEST_SPLIT = 'Show signed lines and contracts side by side';
-const SUGGEST_EMPTY = 'Only open sections that aren’t A - EU';
-const SUGGEST_THRESHOLD = 'Show contracts with loss ratio over 10%';
-const SUGGEST_JUST_TELL = 'Don’t change the desk — just tell me the residual %';
-const SUGGEST_PEERS = 'How does this section look against other sections?';
+const SUGGEST_CONTEXT = 'Can you give me more context on this?';
 const SUGGEST_DRAFT = 'Draft a query for the residual';
+const SUGGEST_ALL_ISSUES = 'Show me all open issues';
+const SUGGEST_NEXT = 'Next issue';
+const SUGGEST_PORTFOLIO = 'Do any other reinsurers have an open residual?';
+const SUGGEST_JUST_TELL = 'Don’t change the desk — just tell me the residual %';
 
-function msg(role: Message['role'], text: string, chips: MessagePart[] = []): Message {
-  return { role, parts: [{ type: 'text', text }, ...chips] };
+const DEFAULT_DRAFT_BODY =
+  'Please review the €40,000 residual on Due for section A - EU on the Q1 2026 statement. Internal tie-out does not reconcile within tolerance (€1). Kindly confirm or provide a corrected bordereaux.';
+
+const RVI_CHASE_DRAFT_BODY =
+  'RVI Q1 2026 statement was due 28 May 2026 and remains outstanding (18 days overdue). Please confirm the expected delivery date, or advise if a revised bordereaux lag applies.';
+
+function msg(role: Message['role'], text: string, extras: MessagePart[] = []): Message {
+  return { role, parts: [{ type: 'text', text }, ...extras] };
 }
 
 function userText(m: Message): string {
@@ -110,31 +153,43 @@ function userText(m: Message): string {
 }
 
 function activeSuggestions(): string[] {
-  if (!primaryTable()) return [SUGGEST_DRAFT];
+  if (state.deskMode === 'roster') return [SUGGEST_OPEN_TOR];
+  if (!caseTreatyId()) return [SUGGEST_ALL_ISSUES, SUGGEST_NEXT];
   const d = state.demo;
   const out: string[] = [];
+  // Investigation story: materiality → situate → query → back to roster / next → optional portfolio.
   if (!d.sawResidualPct) out.push(SUGGEST_RESIDUAL_PCT);
-  else if (!d.sawCompare) out.push(SUGGEST_COMPARE);
-  else if (!d.sawSplit) out.push(SUGGEST_SPLIT);
-  else if (!d.sawEmpty) out.push(SUGGEST_EMPTY);
-  else if (!d.sawThreshold) out.push(SUGGEST_THRESHOLD);
+  else if (!d.sawZoomOut) out.push(SUGGEST_CONTEXT);
+  else if (!d.sawDraft) out.push(SUGGEST_DRAFT);
   else {
-    out.push(SUGGEST_JUST_TELL);
-    out.push(SUGGEST_PEERS);
-    out.push(SUGGEST_DRAFT);
+    out.push(SUGGEST_ALL_ISSUES, SUGGEST_NEXT);
+    if (!d.sawPortfolio) out.push(SUGGEST_PORTFOLIO);
+    else out.push(SUGGEST_JUST_TELL);
   }
   return out;
 }
 
+function emptyDemo(): AppState['demo'] {
+  return {
+    sawResidualPct: false,
+    sawZoomOut: false,
+    sawDraft: false,
+    sawPortfolio: false,
+  };
+}
+
 const state: AppState = {
-  screen: 'home',
+  deskMode: 'roster',
   caseId: null,
   desk: [],
   layout: 'stack',
   focusTableId: null,
-  messages: [],
+  messages: [
+    msg('agent', 'Here are the items that need your attention today.'),
+  ],
   draftOpen: false,
-  saved: false,
+  draftSent: false,
+  draftBody: DEFAULT_DRAFT_BODY,
   fullRecord: false,
   flash: null,
   compose: '',
@@ -143,17 +198,79 @@ const state: AppState = {
   settingsQuery: '',
   settingsSearchOpen: false,
   pendingRemoveId: null,
-  chatCollapsed: false,
+  chatCollapsed: true,
   homeSort: 'urgency',
   chipMenu: null,
-  demo: {
-    sawResidualPct: false,
-    sawCompare: false,
-    sawSplit: false,
-    sawEmpty: false,
-    sawThreshold: false,
-  },
+  toast: null,
+  draftUndo: null,
+  drawer: [],
+  drawerOpen: false,
+  drawerRange: 'today',
+  drawerCustomFrom: '',
+  drawerCustomTo: '',
+  drawerSelected: [],
+  demo: emptyDemo(),
 };
+
+let toastTimer: number | null = null;
+let toastSeq = 0;
+let pendingDeskScroll = false;
+
+function markDeskScroll(): void {
+  pendingDeskScroll = true;
+}
+
+function showToast(message: string): void {
+  if (toastTimer != null) window.clearTimeout(toastTimer);
+  const id = ++toastSeq;
+  state.toast = { id, message };
+  render();
+  toastTimer = window.setTimeout(() => {
+    if (state.toast?.id === id) {
+      state.toast = null;
+      state.draftUndo = null;
+      render();
+    }
+  }, 5000);
+}
+
+function dismissDraftWidget(): void {
+  if (!state.draftOpen) return;
+  const ta = app.querySelector<HTMLTextAreaElement>('[data-draft-body]');
+  if (ta && !state.draftSent) state.draftBody = ta.value;
+  state.draftUndo = { body: state.draftBody, sent: state.draftSent };
+  state.draftOpen = false;
+  state.draftSent = false;
+  showToast('Widget dismissed');
+}
+
+function undoDismissDraft(): void {
+  if (!state.draftUndo) return;
+  state.draftBody = state.draftUndo.body;
+  state.draftSent = state.draftUndo.sent;
+  state.draftOpen = true;
+  state.draftUndo = null;
+  state.toast = null;
+  if (toastTimer != null) {
+    window.clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  markDeskScroll();
+  render();
+}
+
+function scrollDeskToLatest(): void {
+  const scroller = app.querySelector('.desk-scroll');
+  if (!scroller) return;
+  const widgets = scroller.querySelectorAll(
+    '.desk-composition > *, .draft-panel',
+  );
+  const last = widgets[widgets.length - 1] as HTMLElement | undefined;
+  if (!last) return;
+  requestAnimationFrame(() => {
+    last.scrollIntoView({ behavior: 'smooth', block: 'end', inline: 'nearest' });
+  });
+}
 
 function iconPanelSidebar(): string {
   return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -179,6 +296,15 @@ function iconSortDate(): string {
   </svg>`;
 }
 
+/** Desk organizer tray — box with shelf lines. */
+function iconDrawer(): string {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="4" y="5" width="16" height="14" rx="1.5"/>
+    <path d="M4 10.5h16"/>
+    <path d="M4 15h16"/>
+  </svg>`;
+}
+
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
@@ -191,7 +317,16 @@ function primaryTable(): TableDeskObject | null {
     (o): o is TableDeskObject => o.kind === 'table' && o.id === state.focusTableId,
   );
   if (focused) return focused;
-  return state.desk.find((o): o is TableDeskObject => o.kind === 'table') ?? null;
+  return state.desk.find((o): o is TableDeskObject => o.kind === 'table' && !o.title) ?? null;
+}
+
+function primarySection(): SectionDeskObject | null {
+  return state.desk.find((o): o is SectionDeskObject => o.kind === 'section') ?? null;
+}
+
+function caseTreatyId(): string | null {
+  // Prefer the case section (first section on desk) over any expanded table.
+  return primarySection()?.treatyId ?? primaryTable()?.treatyId ?? null;
 }
 
 function tableById(id: string | undefined): TableDeskObject | null {
@@ -201,6 +336,119 @@ function tableById(id: string | undefined): TableDeskObject | null {
 
 function treatyFor(table: TableDeskObject): TreatyObject | null {
   return TREATIES[table.treatyId] ?? null;
+}
+
+function sectionObjects(): SectionDeskObject[] {
+  return state.desk.filter((o): o is SectionDeskObject => o.kind === 'section');
+}
+
+/** Patch fields on the case section card without rebuilding the desk. */
+function patchCaseSection(
+  patch: Partial<Pick<SectionDeskObject, 'highlightDue' | 'residualShare' | 'section'>>,
+): void {
+  const cur = primarySection();
+  if (!cur) return;
+  state.desk = state.desk.map((o) =>
+    o.kind === 'section' && o.id === cur.id ? { ...o, ...patch } : o,
+  );
+}
+
+/** Case focus section — owns the primary desk slot (optionally keep an added treaty table). */
+function focusSectionOnDesk(
+  treatyId: string,
+  section: string,
+  opts?: {
+    highlightDue?: boolean;
+    residualShare?: string;
+    keepTables?: boolean;
+  },
+): SectionDeskObject {
+  const sectionObj = createSectionObject(treatyId, section, {
+    highlightDue: opts?.highlightDue ?? true,
+    residualShare: opts?.residualShare,
+  });
+  const tables = opts?.keepTables
+    ? state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !o.title)
+    : [];
+  const insights = state.desk.filter((o): o is InsightDeskObject => o.kind === 'insight');
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  state.desk = [sectionObj, ...tables, ...insights, ...panes];
+  state.focusTableId = tables[0]?.id ?? null;
+  state.layout = 'stack';
+  return sectionObj;
+}
+
+/**
+ * Add (or refresh) the treaty sections table under the case section card.
+ * Keeps the section focus object so both are visible for now.
+ */
+function addTreatyTableBesideSection(
+  treatyId: string,
+  viewPatch?: Partial<ViewState>,
+): TableDeskObject {
+  const caseSection =
+    primarySection() ?? focusSectionOnDesk(treatyId, 'A - EU', { highlightDue: true });
+
+  const base = defaultViewState(treatyId);
+  const view = {
+    ...base,
+    ...viewPatch,
+    tab: 'sections' as ViewId,
+    section: null,
+    highlightDue: true,
+    exploredPeers: true,
+  };
+
+  let table = primaryTable();
+  if (table && table.treatyId === treatyId) {
+    patchTable(table.id, { view: { ...table.view, ...view } });
+  } else {
+    table = createTableObject(treatyId, { id: `table-${treatyId}-sections`, view });
+  }
+
+  const insights = state.desk.filter((o): o is InsightDeskObject => o.kind === 'insight');
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  // Only this treaty's case section + its collection table (drop foreign peer sections).
+  state.desk = [caseSection, table, ...insights, ...panes];
+  state.focusTableId = table.id;
+  state.layout = 'stack';
+  markDeskScroll();
+  return table;
+}
+
+/** Replace section focus with the treaty collection (used when an intent needs a table-only desk). */
+function expandToTreatyTable(
+  treatyId: string,
+  viewPatch?: Partial<ViewState>,
+): TableDeskObject {
+  const existing = primaryTable();
+  if (existing) {
+    if (viewPatch) patchTable(existing.id, { view: { ...existing.view, ...viewPatch } });
+    state.desk = state.desk.filter((o) => o.kind !== 'section');
+    state.focusTableId = existing.id;
+    return existing;
+  }
+  const base = defaultViewState(treatyId);
+  const table = createTableObject(treatyId, {
+    view: viewPatch ? { ...base, ...viewPatch } : base,
+  });
+  const insights = state.desk.filter((o): o is InsightDeskObject => o.kind === 'insight');
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  state.desk = [table, ...insights, ...panes];
+  state.focusTableId = table.id;
+  return table;
+}
+
+/** Table for agent intents — expands section focus when the op needs a collection. */
+function requireTreatyTable(viewPatch?: Partial<ViewState>): TableDeskObject | null {
+  const tid = caseTreatyId();
+  if (!tid) return null;
+  if (primaryTable()) {
+    const t = primaryTable()!;
+    if (viewPatch) patchTable(t.id, { view: { ...t.view, ...viewPatch } });
+    return t;
+  }
+  return expandToTreatyTable(tid, viewPatch);
 }
 
 function patchTable(tableId: string, patch: Partial<TableDeskObject>): void {
@@ -224,50 +472,57 @@ function patchTableView(tableId: string | undefined, viewPatch: Partial<ViewStat
   }
 }
 
-function placeInsightOnDesk(insight: InsightDeskObject): void {
-  // Drop legacy math/compare ids if any linger from older sessions in memory.
-  const rest = state.desk.filter(
-    (o) =>
-      o.id !== insight.id &&
-      o.id !== 'math-residual-pct' &&
-      o.id !== 'compare-residual',
+/** Pin Residual / ITD beside the section card; keep the treaty table below. */
+function placeResidualInsightBesideSection(): void {
+  const tid = caseTreatyId() ?? 'tor-qs-2025';
+  const section =
+    primarySection() ??
+    focusSectionOnDesk(tid, 'A - EU', { highlightDue: true, keepTables: true });
+  patchCaseSection({ highlightDue: true });
+  const insight = residualInsightTor();
+  const tables = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !o.title);
+  const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
+  const otherInsights = state.desk.filter(
+    (o): o is InsightDeskObject => o.kind === 'insight' && o.id !== INSIGHT_RESIDUAL_ID,
   );
-  const primaryIdx = rest.findIndex((o) => o.kind === 'table' && !o.title);
-  if (primaryIdx === -1) {
-    state.desk = [...rest, insight];
-    return;
-  }
-  state.desk = [...rest.slice(0, primaryIdx + 1), insight, ...rest.slice(primaryIdx + 1)];
+  state.desk = [section, insight, ...otherInsights, ...tables, ...panes];
+  state.layout = 'split';
+  markDeskScroll();
 }
 
 function applyDeskOp(op: DeskOp): void {
-  const table = tableById(op.tableId);
-  if (!table) return;
-  const obj = treatyFor(table);
-
-  if (op.type === 'highlight-residual') {
-    patchTableView(table.id, { tab: 'sections', highlightDue: true, section: 'A - EU' }, 'residual');
+  if (op.type === 'focus-section') {
+    focusSectionOnDesk(op.treatyId, op.section, {
+      highlightDue: op.highlightDue ?? true,
+      keepTables: true,
+    });
+    state.flash = 'residual';
+    render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
     return;
   }
-  if (op.type === 'show-residual-insight') {
-    const existing = state.desk.find(
-      (o): o is InsightDeskObject => o.kind === 'insight' && o.id === INSIGHT_RESIDUAL_ID,
-    );
-    // Peers intent expands; chip add keeps peer story if already on desk.
-    const next =
-      op.peers || (existing && existing.subjects.length > 1)
-        ? residualInsightPeers()
-        : residualInsightTor();
-    placeInsightOnDesk(next);
-    patchTable(table.id, {
-      view: {
-        ...table.view,
-        tab: 'sections',
-        highlightDue: true,
-        section: 'A - EU',
-      },
+
+  if (op.type === 'highlight-residual') {
+    const tid = tableById(op.tableId)?.treatyId ?? caseTreatyId();
+    if (!tid) return;
+    focusSectionOnDesk(tid, 'A - EU', {
+      highlightDue: true,
+      keepTables: true,
     });
-    state.focusTableId = table.id;
+    state.flash = 'residual';
+    render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
+    return;
+  }
+
+  if (op.type === 'show-residual-insight') {
+    placeResidualInsightBesideSection();
     state.chipMenu = null;
     state.flash = 'residual';
     render();
@@ -277,6 +532,16 @@ function applyDeskOp(op: DeskOp): void {
     }, 900);
     return;
   }
+
+  if (op.type === 'add-peer-section') {
+    state.chipMenu = null;
+    render();
+    return;
+  }
+
+  const table = tableById(op.tableId) ?? requireTreatyTable();
+  if (!table) return;
+  const obj = treatyFor(table);
   if (op.type === 'clear-filters' || op.type === 'show-all') {
     if (!obj) return;
     const filtersByView = { ...table.view.filtersByView };
@@ -316,64 +581,40 @@ function applyDeskOp(op: DeskOp): void {
   }
 }
 
-function openCase(item: AttentionItem): void {
-  if (!item.objectId) {
-    state.screen = 'case';
-    state.caseId = item.id;
-    state.desk = [];
-    state.focusTableId = null;
-    state.messages = [
-      msg(
-        'agent',
-        `I can open ${item.title.split(' ')[0]} as a case, but this prototype only projects a display object for TOR. Try the resolve item.`,
-      ),
-    ];
-    state.draftOpen = false;
-    state.saved = false;
-    render();
-    return;
-  }
-  const table = createTableObject(item.objectId);
-  state.screen = 'case';
-  state.caseId = item.id;
-  state.desk = [table];
-  state.layout = 'stack';
-  state.focusTableId = table.id;
-  state.messages = [
-    msg(
-      'agent',
-      "I've opened the TOR case and pinned the tie-out break on the desk. The residual sits on Due for A - EU.",
-    ),
-  ];
-  state.draftOpen = false;
-  state.saved = false;
-  state.fullRecord = false;
-  state.flash = null;
-  state.modal = null;
-  state.settingsFocus = 'sections';
-  state.settingsQuery = '';
-  state.settingsSearchOpen = false;
-  state.pendingRemoveId = null;
-  state.chatCollapsed = false;
-  state.chipMenu = null;
-  state.demo = {
-    sawResidualPct: false,
-    sawCompare: false,
-    sawSplit: false,
-    sawEmpty: false,
-    sawThreshold: false,
+/** Snapshot the focused issue into the drawer (upsert by caseId). */
+function parkCurrentCluster(): void {
+  if (state.deskMode !== 'focus' || !state.caseId) return;
+  const item = currentItem();
+  const ta = app.querySelector<HTMLTextAreaElement>('[data-draft-body]');
+  if (ta && state.draftOpen && !state.draftSent) state.draftBody = ta.value;
+  const cluster: DrawerCluster = {
+    caseId: state.caseId,
+    title: item?.title ?? state.caseId,
+    detail: item?.detail ?? '',
+    kind: item?.kind ?? 'resolve',
+    desk: structuredClone(state.desk),
+    layout: state.layout,
+    focusTableId: state.focusTableId,
+    draftOpen: state.draftOpen,
+    draftSent: state.draftSent,
+    draftBody: state.draftBody,
+    demo: { ...state.demo },
+    updatedAt: Date.now(),
   };
-  render();
+  const idx = state.drawer.findIndex((c) => c.caseId === cluster.caseId);
+  if (idx >= 0) state.drawer = state.drawer.map((c, i) => (i === idx ? cluster : c));
+  else state.drawer = [cluster, ...state.drawer];
 }
 
-function closeCase(): void {
-  state.screen = 'home';
+function clearFocusSurface(): void {
   state.caseId = null;
   state.desk = [];
   state.focusTableId = null;
   state.layout = 'stack';
-  state.messages = [];
   state.draftOpen = false;
+  state.draftSent = false;
+  state.draftBody = DEFAULT_DRAFT_BODY;
+  state.demo = emptyDemo();
   state.fullRecord = false;
   state.flash = null;
   state.modal = null;
@@ -381,19 +622,222 @@ function closeCase(): void {
   state.settingsQuery = '';
   state.settingsSearchOpen = false;
   state.pendingRemoveId = null;
-  state.chatCollapsed = false;
   state.chipMenu = null;
+  state.draftUndo = null;
+}
+
+/** Put the issue roster back on the desk; park whatever was in focus. */
+function showRoster(opts?: { quiet?: boolean }): void {
+  parkCurrentCluster();
+  state.deskMode = 'roster';
+  clearFocusSurface();
+  if (!opts?.quiet) {
+    state.messages = [
+      ...state.messages,
+      msg(
+        'agent',
+        state.drawer.length > 0
+          ? `Back to the open issues. ${state.drawer.length} parked from earlier work.`
+          : 'Back to the open issues.',
+      ),
+    ];
+  }
   render();
 }
 
-function tableCount(): number {
-  return state.desk.filter((o) => o.kind === 'table').length;
+function seedArtCommissionTable(): TableDeskObject {
+  const base = defaultViewState('art-qs-2025');
+  const enabledViews = new Set(base.enabledViews);
+  enabledViews.add('signed-lines');
+  enabledViews.add('contracts');
+  const view: ViewState = {
+    ...base,
+    tab: 'signed-lines',
+    section: null,
+    highlightDue: false,
+    enabledViews,
+    exploredPeers: false,
+  };
+  return createTableObject('art-qs-2025', {
+    id: 'table-art-commission',
+    view,
+  });
+}
+
+function seedFreshFocus(item: AttentionItem): string {
+  state.layout = 'stack';
+  state.focusTableId = null;
+  state.draftSent = false;
+  state.demo = emptyDemo();
+
+  if (item.id === 'rvi-chase') {
+    state.desk = [];
+    state.draftOpen = true;
+    state.draftBody = RVI_CHASE_DRAFT_BODY;
+    return 'RVI statement is 18 days overdue. Draft chase ready.';
+  }
+
+  if (item.id === 'art-review') {
+    const table = seedArtCommissionTable();
+    state.desk = [table];
+    state.focusTableId = table.id;
+    state.draftOpen = false;
+    state.draftBody = DEFAULT_DRAFT_BODY;
+    return 'ART commission true-up on the signed-line object — 43.70% → 44.20% at 50% LR (~$1.15M).';
+  }
+
+  if (item.objectId) {
+    state.desk = [createSectionObject(item.objectId, 'A - EU', { highlightDue: true })];
+    state.draftOpen = false;
+    state.draftBody = DEFAULT_DRAFT_BODY;
+    return 'Opened on section A – EU. Tie-out break sits on Due.';
+  }
+
+  state.desk = [];
+  state.draftOpen = false;
+  state.draftBody = DEFAULT_DRAFT_BODY;
+  return `Opened “${item.title}”. No projected desk object yet in this prototype.`;
+}
+
+function applyFreshFocus(item: AttentionItem, opts?: { announce?: string }): void {
+  state.deskMode = 'focus';
+  state.caseId = item.id;
+  state.fullRecord = false;
+  state.flash = null;
+  state.modal = null;
+  state.settingsFocus = item.id === 'art-review' ? 'signed-lines' : 'sections';
+  state.settingsQuery = '';
+  state.settingsSearchOpen = false;
+  state.pendingRemoveId = null;
+  state.chipMenu = null;
+  state.draftUndo = null;
+  state.drawerOpen = false;
+
+  const parked = state.drawer.find((c) => c.caseId === item.id);
+  let announce = opts?.announce ?? null;
+
+  if (parked) {
+    state.desk = structuredClone(parked.desk);
+    state.layout = parked.layout;
+    state.focusTableId = parked.focusTableId;
+    state.draftOpen = parked.draftOpen;
+    state.draftSent = parked.draftSent;
+    state.draftBody = parked.draftBody;
+    state.demo = { ...parked.demo };
+    announce = announce ?? `Back on “${item.title}”.`;
+    markDeskScroll();
+  } else {
+    const seeded = seedFreshFocus(item);
+    announce = announce ?? seeded;
+  }
+
+  if (announce) state.messages = [...state.messages, msg('agent', announce)];
+}
+
+/** Focus one issue: park current work, restore cluster or start fresh. */
+function focusIssue(item: AttentionItem): void {
+  if (state.deskMode === 'focus' && state.caseId === item.id) {
+    render();
+    return;
+  }
+  parkCurrentCluster();
+  applyFreshFocus(item);
+  render();
+}
+
+function sortedAttention(): AttentionItem[] {
+  return sortAttention(ATTENTION, state.homeSort);
+}
+
+/** Park current, open the next attention item after this one (wraps). */
+function focusNextIssue(): void {
+  const list = sortedAttention();
+  if (list.length === 0) return;
+  const cur = state.caseId ? list.findIndex((a) => a.id === state.caseId) : -1;
+  const next = list[(cur + 1) % list.length]!;
+  if (state.deskMode === 'focus' && next.id === state.caseId && list.length === 1) {
+    state.messages = [
+      ...state.messages,
+      msg('agent', 'That’s the only open issue on the roster right now.'),
+    ];
+    render();
+    return;
+  }
+  parkCurrentCluster();
+  applyFreshFocus(next, {
+    announce: `Next up: ${next.title}.`,
+  });
+  render();
+}
+
+function removeDrawerCluster(caseId: string): void {
+  state.drawer = state.drawer.filter((c) => c.caseId !== caseId);
+  state.drawerSelected = state.drawerSelected.filter((id) => id !== caseId);
+  render();
+}
+
+function clearSelectedDrawerClusters(): void {
+  if (state.drawerSelected.length === 0) return;
+  const drop = new Set(state.drawerSelected);
+  state.drawer = state.drawer.filter((c) => !drop.has(c.caseId));
+  state.drawerSelected = [];
+  showToast(
+    drop.size === 1 ? 'Cleared 1 item from drawer' : `Cleared ${drop.size} items from drawer`,
+  );
+}
+
+function startOfLocalDay(d: Date): number {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function filteredDrawerClusters(): DrawerCluster[] {
+  const now = new Date();
+  const todayStart = startOfLocalDay(now);
+  const dayMs = 24 * 60 * 60 * 1000;
+  let from = 0;
+  let to = Number.POSITIVE_INFINITY;
+
+  switch (state.drawerRange) {
+    case 'today':
+      from = todayStart;
+      to = todayStart + dayMs;
+      break;
+    case 'week': {
+      const dow = (now.getDay() + 6) % 7; // Mon=0
+      from = todayStart - dow * dayMs;
+      to = from + 7 * dayMs;
+      break;
+    }
+    case 'last-week': {
+      const dow = (now.getDay() + 6) % 7;
+      const thisWeekStart = todayStart - dow * dayMs;
+      from = thisWeekStart - 7 * dayMs;
+      to = thisWeekStart;
+      break;
+    }
+    case 'month':
+      from = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+      to = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime();
+      break;
+    case 'custom': {
+      if (state.drawerCustomFrom) {
+        const [y, m, d] = state.drawerCustomFrom.split('-').map(Number);
+        from = new Date(y!, m! - 1, d!).getTime();
+      }
+      if (state.drawerCustomTo) {
+        const [y, m, d] = state.drawerCustomTo.split('-').map(Number);
+        to = new Date(y!, m! - 1, d!).getTime() + dayMs;
+      }
+      break;
+    }
+  }
+
+  return state.drawer.filter((c) => c.updatedAt >= from && c.updatedAt < to);
 }
 
 function requestRemovePanel(objectId: string): void {
   const target = state.desk.find((o) => o.id === objectId);
   if (!target) return;
-  if (target.kind === 'table' && tableCount() <= 1) return;
   state.pendingRemoveId = objectId;
   state.modal = 'confirm-remove';
   render();
@@ -401,8 +845,7 @@ function requestRemovePanel(objectId: string): void {
 
 function confirmRemovePanel(): void {
   const id = state.pendingRemoveId;
-  const target = id ? state.desk.find((o) => o.id === id) : null;
-  if (!id || !target || (target.kind === 'table' && tableCount() <= 1)) {
+  if (!id || !state.desk.some((o) => o.id === id)) {
     state.modal = null;
     state.pendingRemoveId = null;
     render();
@@ -489,22 +932,59 @@ function facetAllows(filters: DimFilterMap, dim: string, value: string, columnOn
 function agentReply(userTextIn: string): void {
   const q = userTextIn.trim().toLowerCase();
   state.messages = [...state.messages, msg('user', userTextIn.trim())];
-  const table = primaryTable();
 
-  if (!table || !treatyFor(table)) {
+  const wantsRoster =
+    (q.includes('all') && (q.includes('issue') || q.includes('open'))) ||
+    q.includes('show me all') ||
+    q.includes('back to the list') ||
+    q.includes('attention list') ||
+    q.includes('roster');
+  const wantsNext =
+    q.includes('next issue') ||
+    (q.includes('next') && (q.includes('case') || q.includes('item')));
+  const wantsOpenTor =
+    q.includes('open the tor') ||
+    q.includes('tor resolve') ||
+    (q.includes('open') && q.includes('tor'));
+
+  if (wantsRoster) {
+    showRoster();
+    return;
+  }
+  if (wantsNext) {
+    focusNextIssue();
+    return;
+  }
+  if (wantsOpenTor || (state.deskMode === 'roster' && (q.includes('open') || q.includes('tor')))) {
+    const tor = ATTENTION.find((a) => a.id === 'tor-fix')!;
+    focusIssue(tor);
+    return;
+  }
+
+  if (state.deskMode === 'roster') {
     state.messages = [
       ...state.messages,
-      msg('agent', 'This case has no projected display object in the prototype yet.'),
+      msg('agent', 'Open an issue from the list, or say which one you want.'),
     ];
     render();
     return;
   }
 
-  const residualChip: MessagePart = {
-    type: 'chip',
-    label: 'Residual / section ITD',
-    value: '3.2%',
-    apply: { type: 'show-residual-insight', tableId: table.id },
+  const tid = caseTreatyId();
+
+  if (!tid || !TREATIES[tid]) {
+    state.messages = [
+      ...state.messages,
+      msg('agent', 'This issue has no projected display object yet.'),
+    ];
+    render();
+    return;
+  }
+
+  const residualCalcPart: MessagePart = {
+    type: 'calc',
+    calc: residualTorCalculation(),
+    apply: { type: 'show-residual-insight' },
   };
 
   if (
@@ -514,11 +994,7 @@ function agentReply(userTextIn: string): void {
     state.demo.sawResidualPct = true;
     state.messages = [
       ...state.messages,
-      msg(
-        'agent',
-        '3.2% of A – EU section ITD (€40K / €1.24M). Desk unchanged — open the readout to pin it.',
-        [residualChip],
-      ),
+      msg('agent', 'Desk left as-is.', [residualCalcPart]),
     ];
     render();
     return;
@@ -529,158 +1005,85 @@ function agentReply(userTextIn: string): void {
     q.includes('what % of section')
   ) {
     state.demo.sawResidualPct = true;
-    applyDeskOp({ type: 'highlight-residual', tableId: table.id });
+    if (primarySection()) {
+      patchCaseSection({ highlightDue: true });
+    } else {
+      focusSectionOnDesk(tid, 'A - EU', { highlightDue: true, keepTables: true });
+    }
+    state.flash = 'residual';
     state.messages = [
       ...state.messages,
       msg(
         'agent',
-        'Due is highlighted on A – EU. Open the readout to pin Residual / ITD on the desk.',
-        [residualChip],
+        'Material enough to chase (tolerance €1).',
+        [residualCalcPart],
       ),
     ];
     render();
-    return;
-  }
-
-  if (q.includes('compare') && q.includes('allianz')) {
-    state.demo.sawCompare = true;
-    applyDeskOp({ type: 'show-residual-insight', tableId: table.id, peers: true });
-    state.messages = [
-      ...state.messages,
-      msg('agent', 'Pinned TOR and Allianz side by side on the desk.'),
-    ];
-    render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
     return;
   }
 
   if (
-    (q.includes('signed line') && q.includes('contract')) ||
-    q.includes('side by side')
+    q.includes('other reinsurer') ||
+    q.includes('open residual') ||
+    (q.includes('portfolio') && q.includes('residual')) ||
+    (q.includes('allianz') && (q.includes('residual') || q.includes('open') || q.includes('compare')))
   ) {
-    state.demo.sawSplit = true;
-    const base = table.view;
-    const lines = createTableObject(table.treatyId, {
-      id: 'table-signed-lines',
-      title: 'Signed lines',
-      view: cloneViewForTab(base, 'signed-lines'),
-    });
-    const contracts = createTableObject(table.treatyId, {
-      id: 'table-contracts',
-      title: 'Contracts',
-      view: cloneViewForTab(base, 'contracts'),
-    });
-    // Keep the original treaty panel; add panes below (avoid duplicates on re-ask).
-    // Do not enable signed-lines/contracts tabs on the QS object — those live as panes only.
-    const keep = state.desk.filter(
-      (o) => o.id !== 'table-signed-lines' && o.id !== 'table-contracts',
-    );
-    state.desk = [...keep, lines, contracts];
-    state.layout = 'split';
-    state.focusTableId = lines.id;
-    state.messages = [
-      ...state.messages,
-      msg(
-        'agent',
-        'Kept your sections panel and opened Signed lines and Contracts beside each other below. Remove any pane with ✕ next to the gear.',
-      ),
-    ];
-    render();
-    return;
-  }
-
-  if (
-    (q.includes('open') && (q.includes("aren't") || q.includes('aren’t') || q.includes('not'))) ||
-    (q.includes('only open') && q.includes('a -'))
-  ) {
-    state.demo.sawEmpty = true;
-    // Open-only + pin to a tied section → empty set (demo for recovery actions).
-    patchTableView(table.id, {
-      tab: 'sections',
-      section: 'B - UK',
-      filtersByView: {
-        ...table.view.filtersByView,
-        sections: { ...table.view.filtersByView.sections, status: new Set(['Open']) },
-      },
-      exploredPeers: true,
-    });
-    state.messages = [
-      ...state.messages,
-      msg(
-        'agent',
-        'Filtered to Open sections excluding A - EU — that set is empty. Use the empty-state actions to recover.',
-      ),
-    ];
-    render();
-    return;
-  }
-
-  if (
-    (q.includes('loss ratio') || q.includes('lr ')) &&
-    (q.includes('over') || q.includes('>') || q.includes('above') || q.includes('10'))
-  ) {
-    state.demo.sawThreshold = true;
-    // Collapse split back to one contracts-focused table for clarity
-    const contractsView = cloneViewForTab(table.view, 'contracts');
-    contractsView.columnsByView.contracts = new Set([
-      ...contractsView.columnsByView.contracts,
-      'lossRatio',
-    ]);
-    contractsView.thresholdsByView = {
-      ...contractsView.thresholdsByView,
-      contracts: [{ key: 'lossRatio', op: '>', value: 10 }],
+    state.demo.sawPortfolio = true;
+    const portfolioChip: MessagePart = {
+      type: 'chip',
+      label: 'Open residuals · panel',
+      value: '1',
     };
-    const contractsTable = createTableObject(table.treatyId, {
-      id: 'table-tor-main',
-      view: contractsView,
-    });
-    state.desk = [
-      ...state.desk.filter((o) => o.kind === 'insight'),
-      contractsTable,
-    ];
-    state.layout = 'stack';
-    state.focusTableId = contractsTable.id;
     state.messages = [
       ...state.messages,
       msg(
         'agent',
-        'Contracts with loss ratio over 10% — threshold is on the desk. You can also add thresholds from the gear search.',
-        [
-          {
-            type: 'chip',
-            label: 'Filter',
-            value: 'LR > 10%',
-            apply: {
-              type: 'set-threshold',
-              viewId: 'contracts',
-              key: 'lossRatio',
-              op: '>',
-              value: 10,
-              tableId: contractsTable.id,
-            },
-          },
-        ],
+        'Only Torgus has an open residual on your panel right now. Allianz and the others are tied — no matching section assumed.',
+        [portfolioChip],
       ),
     ];
     render();
     return;
   }
 
-  if (q.includes('other section') || q.includes('against other') || q.includes('peer')) {
-    patchTableView(table.id, {
+  const wantsContext =
+    q.includes('more context') ||
+    q.includes('give me context') ||
+    (q.includes('context') && q.includes('this'));
+  const wantsPeerSections =
+    q.includes('other section') ||
+    q.includes('against other') ||
+    q.includes('peer') ||
+    (q.includes('open too') && q.includes('section'));
+
+  if (wantsContext || wantsPeerSections) {
+    state.demo.sawZoomOut = true;
+    addTreatyTableBesideSection(tid, {
       section: null,
       tab: 'sections',
       highlightDue: true,
       exploredPeers: true,
-    }, 'section');
-    state.messages = [
-      ...state.messages,
-      msg('agent', 'Cleared the section filter — all nine sections on the desk. A - EU is the only open row.'),
-    ];
+    });
+    state.flash = 'section';
+    const reply = wantsContext
+      ? 'Here’s the rest of the treaty around this break — A – EU is the only open section; Due is the outlier.'
+      : 'Added the treaty’s sections under your A – EU card. Only A – EU is Open — the break is localized.';
+    state.messages = [...state.messages, msg('agent', reply)];
     render();
+    window.setTimeout(() => {
+      state.flash = null;
+      render();
+    }, 900);
     return;
   }
 
-  if (q.includes('signed line')) {
+  if (q.includes('signed line') && !q.includes('contract')) {
+    const table = requireTreatyTable()!;
     const enabled = new Set(table.view.enabledViews);
     enabled.add('signed-lines');
     patchTableView(
@@ -697,28 +1100,28 @@ function agentReply(userTextIn: string): void {
   }
 
   if (q.includes('draft') || q.includes('query')) {
+    state.demo.sawDraft = true;
     state.draftOpen = true;
+    state.draftSent = false;
     state.messages = [
       ...state.messages,
-      msg('agent', 'Draft is open below the desk actions — edit it or send when ready.'),
+      msg('agent', 'Draft is ready — edit if needed, then send.'),
     ];
+    markDeskScroll();
     render();
     return;
   }
 
   if (q.includes('section') && (q.includes('a -') || q.includes('a–') || q.includes('eu'))) {
-    patchTableView(table.id, { tab: 'sections', section: 'A - EU', highlightDue: true }, 'section');
-    state.messages = [...state.messages, msg('agent', 'Scoped the sections table back to A - EU.')];
+    focusSectionOnDesk(tid, 'A - EU', { highlightDue: true, keepTables: true });
+    state.messages = [...state.messages, msg('agent', 'Back on section A – EU.')];
     render();
     return;
   }
 
   state.messages = [
     ...state.messages,
-    msg(
-      'agent',
-      'Try a suggestion — residual %, Allianz compare, side-by-side tables, or a loss-ratio threshold.',
-    ),
+    msg('agent', 'Not sure what you need on this one — try one of the suggestions below.'),
   ];
   render();
 }
@@ -727,27 +1130,27 @@ function sendCompose(): void {
   const text = state.compose.trim();
   if (!text) return;
   state.compose = '';
-  if (state.screen === 'home') {
-    const tor = ATTENTION.find((a) => a.id === 'tor-fix')!;
-    openCase(tor);
-    state.messages = [
-      ...state.messages,
-      msg('user', text),
-      msg('agent', 'Opened the top resolve item so we have a desk to work on.'),
-    ];
-    render();
-    return;
-  }
   agentReply(text);
 }
 
 function renderTopnav(): string {
+  const drawerCount = state.drawer.length;
+  const chatLabel = state.chatCollapsed ? 'Expand chat' : 'Collapse chat';
   return `<nav class="topnav">
     <a href="/gallery.html">Gallery</a>
     <a href="#">Marketplace</a>
     <a href="#">Community</a>
     <a href="#">Ask AI</a>
     <div class="avatars"><span class="avatar"></span><span class="avatar"></span></div>
+    <div class="topnav-tools">
+      <button type="button" class="icon-btn drawer-toggle${state.drawerOpen ? ' is-open' : ''}${drawerCount > 0 ? ' has-items' : ''}" data-action="toggle-drawer" aria-expanded="${state.drawerOpen}" aria-haspopup="dialog" aria-label="Drawer${drawerCount > 0 ? `, ${drawerCount} items` : ''}" title="Drawer">
+        ${iconDrawer()}
+        ${drawerCount > 0 ? `<span class="drawer-count">${drawerCount}</span>` : ''}
+      </button>
+      <button type="button" class="icon-btn chat-rail-btn${state.chatCollapsed ? '' : ' is-open'}" data-action="${state.chatCollapsed ? 'expand-chat' : 'collapse-chat'}" aria-label="${esc(chatLabel)}" title="${esc(chatLabel)}">
+        ${iconPanelSidebar()}
+      </button>
+    </div>
   </nav>`;
 }
 
@@ -763,42 +1166,104 @@ function renderCompose(opts: { placeholder?: string; variant?: 'home' | 'chat' }
   </div>`;
 }
 
-function renderHome(): string {
-  const sorted = sortAttention(ATTENTION, state.homeSort);
-  const cards = sorted
+function renderRosterCards(): string {
+  return sortedAttention()
     .map((item) => {
       const kind = KIND_LABEL[item.kind];
-      return `<button type="button" class="attention-card${kind ? '' : ' no-kind'}" data-open="${esc(item.id)}">
+      const parked = state.drawer.some((c) => c.caseId === item.id);
+      return `<button type="button" class="attention-card${kind ? '' : ' no-kind'}${parked ? ' is-parked' : ''}" data-open="${esc(item.id)}">
       ${kind ? `<span class="kind">${esc(kind)}</span>` : ''}
       <span class="attention-copy">
         <h2>${esc(item.title)}</h2>
         <p>${esc(item.detail)}</p>
+        ${parked ? `<span class="parked-tag">In drawer</span>` : ''}
       </span>
       <span class="arrow-btn" aria-hidden="true">→</span>
     </button>`;
     })
     .join('');
+}
 
-  const sortByUrgency = state.homeSort === 'urgency';
-  const sortLabel = sortByUrgency
-    ? 'Sorted by urgency — click to sort by date added'
-    : 'Sorted by date added — click to sort by urgency';
+function renderDrawerDropdown(): string {
+  if (!state.drawerOpen) return '';
+  const ranges: { id: DrawerRange; label: string }[] = [
+    { id: 'today', label: 'Today' },
+    { id: 'week', label: 'This week' },
+    { id: 'last-week', label: 'Last week' },
+    { id: 'month', label: 'This month' },
+    { id: 'custom', label: 'Custom' },
+  ];
+  const rangeTabs = ranges
+    .map(
+      (r) =>
+        `<button type="button" class="drawer-range${state.drawerRange === r.id ? ' is-active' : ''}" data-action="drawer-range" data-range="${r.id}">${esc(r.label)}</button>`,
+    )
+    .join('');
 
-  return `${renderTopnav()}
-    <main class="shell shell--home">
-      <header class="home-hero">
-        <h1>Good morning, ${esc(USER_NAME)}</h1>
-        <div class="date">${esc(TODAY)}</div>
-      </header>
-      <div class="home-lead-row">
-        <p class="home-lead">Here are the items that need your attention today:</p>
-        <button type="button" class="icon-btn home-sort-btn" data-action="toggle-home-sort" aria-label="${esc(sortLabel)}" title="${esc(sortLabel)}">
-          ${sortByUrgency ? iconSortUrgency() : iconSortDate()}
-        </button>
+  const custom =
+    state.drawerRange === 'custom'
+      ? `<div class="drawer-custom">
+          <label>From <input type="date" data-drawer-from value="${esc(state.drawerCustomFrom)}" /></label>
+          <label>To <input type="date" data-drawer-to value="${esc(state.drawerCustomTo)}" /></label>
+        </div>`
+      : '';
+
+  const visible = filteredDrawerClusters();
+  const selectedCount = state.drawerSelected.filter((id) =>
+    visible.some((c) => c.caseId === id),
+  ).length;
+  const allVisibleSelected =
+    visible.length > 0 && visible.every((c) => state.drawerSelected.includes(c.caseId));
+
+  const rows =
+    visible.length === 0
+      ? `<p class="drawer-empty">${
+          state.drawer.length === 0
+            ? 'Drawer’s empty — focused work parks here when you leave an issue.'
+            : 'Nothing in this time range.'
+        }</p>`
+      : visible
+          .map((c) => {
+            const checked = state.drawerSelected.includes(c.caseId);
+            const widgetCount = c.desk.length + (c.draftOpen ? 1 : 0);
+            const draftNote = c.draftOpen && c.desk.length > 0 ? ' · draft' : '';
+            return `<div class="drawer-row">
+              <label class="drawer-check">
+                <input type="checkbox" data-drawer-select="${esc(c.caseId)}" ${checked ? 'checked' : ''} />
+                <span class="visually-hidden">Select</span>
+              </label>
+              <button type="button" class="drawer-open" data-open="${esc(c.caseId)}">
+                <span class="kind">${esc(KIND_LABEL[c.kind] || 'Case')}</span>
+                <span class="drawer-title">${esc(c.title)}</span>
+                <span class="drawer-meta">${widgetCount} widget${widgetCount === 1 ? '' : 's'}${draftNote}</span>
+              </button>
+            </div>`;
+          })
+          .join('');
+
+  const bulk =
+    visible.length > 0
+      ? `<div class="drawer-bulk">
+          <label class="drawer-check drawer-check--all">
+            <input type="checkbox" data-action="drawer-select-all" ${allVisibleSelected ? 'checked' : ''} />
+            <span>Select all</span>
+          </label>
+          <button type="button" class="btn btn-outline" data-action="drawer-clear-selected" ${selectedCount === 0 ? 'disabled' : ''}>
+            Clear selected${selectedCount > 0 ? ` (${selectedCount})` : ''}
+          </button>
+        </div>`
+      : '';
+
+  return `<div class="drawer-backdrop" data-action="close-drawer" aria-hidden="true"></div>
+    <div class="drawer-dropdown" role="dialog" aria-label="Drawer" data-stop>
+      <div class="drawer-head">
+        <div class="drawer-ranges" role="tablist">${rangeTabs}</div>
+        <button type="button" class="icon-btn drawer-close" data-action="close-drawer" aria-label="Close drawer">✕</button>
       </div>
-      <div class="attention-list">${cards}</div>
-    </main>
-    ${renderCompose()}`;
+      ${custom}
+      <div class="drawer-list">${rows}</div>
+      ${bulk}
+    </div>`;
 }
 
 function sectionCell(r: TreatyObject['sections'][0], key: string): string {
@@ -906,9 +1371,11 @@ function renderConfirmRemoveModal(): string {
   const label =
     panel?.kind === 'table'
       ? (panel.title ?? treatyFor(panel)?.label ?? 'this panel')
-      : panel?.kind === 'insight'
-        ? panel.title
-        : 'this panel';
+      : panel?.kind === 'section'
+        ? `Section: ${panel.section.replace(' - ', ' – ')}`
+        : panel?.kind === 'insight'
+          ? panel.title
+          : 'this panel';
   return `<div class="modal-backdrop" data-action="close-modal">
     <div class="modal-card modal-card--confirm" data-stop role="dialog" aria-label="Remove panel">
       <div class="modal-head">
@@ -1215,7 +1682,6 @@ function renderTableObject(table: TableDeskObject): string {
   const tab = view.tab;
   const heading = table.title ?? obj.label;
   const showChrome = !table.title;
-  const canRemove = tableCount() > 1;
 
   const tableBody =
     tab === 'sections'
@@ -1246,11 +1712,7 @@ function renderTableObject(table: TableDeskObject): string {
             <path d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.2 7.2 0 0 0-1.62-.94l-.36-2.54A.48.48 0 0 0 14 2h-4a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.65 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.13.23.4.32.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.41.48.41h4c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.09.48 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"/>
           </svg>
         </button>
-        ${
-          canRemove
-            ? `<button type="button" class="icon-btn" data-action="request-remove" data-table-id="${esc(table.id)}" aria-label="Remove panel">✕</button>`
-            : ''
-        }
+        <button type="button" class="icon-btn" data-action="request-remove" data-table-id="${esc(table.id)}" aria-label="Remove panel">✕</button>
       </div>
     </div>
     ${
@@ -1277,8 +1739,32 @@ function renderTableObject(table: TableDeskObject): string {
   </section>`;
 }
 
+function residualInsightOnDesk(): InsightDeskObject | null {
+  return (
+    state.desk.find(
+      (o): o is InsightDeskObject => o.kind === 'insight' && o.id === INSIGHT_RESIDUAL_ID,
+    ) ?? null
+  );
+}
+
+function renderSectionDeskObject(sectionObj: SectionDeskObject): string {
+  const treaty = TREATIES[sectionObj.treatyId];
+  if (!treaty) {
+    return `<section class="section-object"><p class="residual">Unknown treaty.</p></section>`;
+  }
+  const row = treaty.sections.find((r) => r.section === sectionObj.section);
+  if (!row) {
+    return `<section class="section-object"><p class="residual">Unknown section.</p></section>`;
+  }
+  return renderSectionObject(sectionObj, treaty, row, {
+    flash: state.flash === 'residual',
+    showRemove: true,
+  });
+}
+
 function renderDeskObject(o: DeskObject): string {
   if (o.kind === 'table') return renderTableObject(o);
+  if (o.kind === 'section') return renderSectionDeskObject(o);
   return renderInsightWidget(o, {
     flash: state.flash === 'residual',
     showRemove: true,
@@ -1287,19 +1773,34 @@ function renderDeskObject(o: DeskObject): string {
 }
 
 function renderDesk(): string {
-  if (state.desk.length === 0) {
-    return `<section class="display-object"><p class="residual">No projected display object for this item in the prototype.</p></section>`;
-  }
-  const mains = state.desk.filter(
-    (o) => o.kind === 'insight' || (o.kind === 'table' && !o.title),
+  if (state.desk.length === 0) return '';
+  const sections = sectionObjects();
+  const residual = residualInsightOnDesk();
+  const otherInsights = state.desk.filter(
+    (o): o is InsightDeskObject => o.kind === 'insight' && o.id !== INSIGHT_RESIDUAL_ID,
+  );
+  const primaryTables = state.desk.filter(
+    (o): o is TableDeskObject => o.kind === 'table' && !o.title,
   );
   const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
-  const mainHtml = mains.map(renderDeskObject).join('');
+
+  const focusHtml =
+    sections.map((s) => renderSectionDeskObject(s)).join('') +
+    (residual
+      ? renderInsightWidget(residual, {
+          flash: state.flash === 'residual',
+          showRemove: true,
+          interactiveLinks: true,
+        })
+      : '');
+
+  const insightsHtml = otherInsights.map((o) => renderDeskObject(o)).join('');
+  const tablesHtml = primaryTables.map((o) => renderTableObject(o)).join('');
   const panesHtml =
     panes.length > 0
       ? `<div class="desk-split-row">${panes.map((o) => renderTableObject(o)).join('')}</div>`
       : '';
-  return `<div class="desk-composition">${mainHtml}${panesHtml}</div>`;
+  return `<div class="desk-composition">${focusHtml}${insightsHtml}${tablesHtml}${panesHtml}</div>`;
 }
 
 function renderMessage(m: Message): string {
@@ -1307,6 +1808,33 @@ function renderMessage(m: Message): string {
   const inner = m.parts
     .map((p, partIdx) => {
       if (p.type === 'text') return `<span class="bubble-text">${esc(p.text)}</span>`;
+      if (p.type === 'calc') {
+        const menuOpen =
+          !!p.apply && state.chipMenu?.msg === msgIdx && state.chipMenu.part === partIdx;
+        const menu =
+          menuOpen
+            ? `<div class="chip-menu" role="menu">
+                <button type="button" class="chip-menu-item" role="menuitem" data-chip-add-desk data-chip-msg="${msgIdx}" data-chip-part="${partIdx}">Add to desk</button>
+              </div>`
+            : '';
+        if (!p.apply) {
+          return `<div class="chat-calc-chip" aria-label="Calculation">
+            ${renderCalculationBlock(p.calc, { compact: true })}
+          </div>`;
+        }
+        return `<span class="readout-chip-wrap chat-calc-wrap">
+          <button type="button" class="chat-calc-chip${menuOpen ? ' is-open' : ''}" data-chip-msg="${msgIdx}" data-chip-part="${partIdx}" aria-haspopup="menu" aria-expanded="${menuOpen}" title="Actions">
+            ${renderCalculationBlock(p.calc, { compact: true })}
+          </button>
+          ${menu}
+        </span>`;
+      }
+      if (!p.apply) {
+        return `<span class="readout-chip readout-chip--static" title="${esc(p.label)}">
+          <span class="readout-chip-label">${esc(p.label)}</span>
+          <span class="readout-chip-value">${esc(p.value)}</span>
+        </span>`;
+      }
       const menuOpen =
         state.chipMenu?.msg === msgIdx && state.chipMenu.part === partIdx;
       const menu = menuOpen
@@ -1326,14 +1854,39 @@ function renderMessage(m: Message): string {
   return `<div class="bubble ${m.role}">${inner}</div>`;
 }
 
+function renderDraftPanel(): string {
+  if (!state.draftOpen) return '';
+  const sent = state.draftSent;
+  const title = sent
+    ? `<span class="draft-status-pill">Query sent</span>`
+    : `<strong>Draft query</strong>`;
+  const actions = sent
+    ? `<button type="button" class="btn" data-action="review-draft">Review</button>`
+    : `<button type="button" class="btn primary" data-action="send-draft">Send</button>
+       <button type="button" class="btn" data-action="cancel-draft">Cancel</button>`;
+  return `<div class="draft-panel${sent ? ' is-sent' : ''}" data-desk-widget="draft">
+    <div class="draft-panel-head">
+      ${title}
+      <button type="button" class="icon-btn" data-action="cancel-draft" aria-label="Dismiss draft">✕</button>
+    </div>
+    <textarea class="draft-body" data-draft-body maxlength="2000" rows="3" ${sent ? 'readonly' : ''}>${esc(state.draftBody)}</textarea>
+    <div class="draft-footer">${actions}</div>
+  </div>`;
+}
+
+function renderToast(): string {
+  if (!state.toast) return '';
+  const undo = state.draftUndo
+    ? `<button type="button" class="toast-undo" data-action="undo-dismiss">Undo</button>`
+    : '';
+  return `<div class="desk-toast" role="status">
+    <span>${esc(state.toast.message)}</span>
+    ${undo}
+  </div>`;
+}
+
 function renderThread(): string {
-  if (state.chatCollapsed) {
-    return `<aside class="chat chat--collapsed" aria-label="Chat collapsed">
-      <button type="button" class="icon-btn chat-rail-btn" data-action="expand-chat" aria-label="Expand chat" title="Expand chat">
-        ${iconPanelSidebar()}
-      </button>
-    </aside>`;
-  }
+  if (state.chatCollapsed) return '';
 
   const msgs = state.messages.map(renderMessage).join('');
   const used = new Set(
@@ -1345,11 +1898,6 @@ function renderThread(): string {
     .join('');
 
   return `<aside class="chat">
-    <div class="chat-toolbar">
-      <button type="button" class="icon-btn chat-rail-btn" data-action="collapse-chat" aria-label="Collapse chat" title="Collapse chat">
-        ${iconPanelSidebar()}
-      </button>
-    </div>
     <div class="chat-panel">
       <div class="thread-messages">${msgs}</div>
       ${suggestions ? `<div class="suggestions">${suggestions}</div>` : ''}
@@ -1358,29 +1906,67 @@ function renderThread(): string {
   </aside>`;
 }
 
-function renderCase(): string {
-  const item = currentItem();
-  if (!item) return renderHome();
-  const table = primaryTable();
-  const obj = table ? treatyFor(table) : null;
+function renderDeskSurface(): string {
+  if (state.deskMode === 'roster') {
+    const sortByUrgency = state.homeSort === 'urgency';
+    const sortLabel = sortByUrgency
+      ? 'Sorted by urgency — click to sort by date added'
+      : 'Sorted by date added — click to sort by urgency';
+    return `<div class="desk-roster">
+      <header class="roster-hero">
+        <h1>Good morning, ${esc(USER_NAME)}</h1>
+        <div class="date">${esc(TODAY)}</div>
+      </header>
+      <div class="home-lead-row">
+        <p class="home-lead">Open issues</p>
+        <button type="button" class="icon-btn home-sort-btn" data-action="toggle-home-sort" aria-label="${esc(sortLabel)}" title="${esc(sortLabel)}">
+          ${sortByUrgency ? iconSortUrgency() : iconSortDate()}
+        </button>
+      </div>
+      <div class="attention-list">${renderRosterCards()}</div>
+    </div>`;
+  }
 
-  const draft = state.draftOpen
-    ? `<div class="display-object">
-        <strong>Draft query</strong>
-        <textarea style="width:100%;min-height:7rem;margin-top:0.5rem;background:#111;border:1px solid var(--border);border-radius:0.5rem;color:var(--text);padding:0.75rem;font:inherit">Please review the €40,000 residual on Due for section A - EU on the Q1 2026 statement. Internal tie-out does not reconcile within tolerance (€1). Kindly confirm or provide a corrected bordereaux.</textarea>
-        <div class="case-actions">
-          <button type="button" class="btn primary" data-action="send-draft">Send</button>
-          <button type="button" class="btn" data-action="cancel-draft">Cancel</button>
-        </div>
-      </div>`
-    : '';
+  const item = currentItem();
+  if (!item) {
+    state.deskMode = 'roster';
+    return renderDeskSurface();
+  }
+  const draft = renderDraftPanel();
+  return `<div class="case-banner">
+      <span class="kind">${esc(KIND_LABEL[item.kind] || 'Case')}</span>
+      <div class="case-banner-copy">
+        <h2>${esc(item.title)}</h2>
+        <span class="meta">${esc(item.detail)}</span>
+      </div>
+    </div>
+    ${renderDesk()}
+    ${draft}`;
+}
+
+function renderCaseActions(): string {
+  if (state.deskMode !== 'focus') return '';
+  return `<div class="case-actions">
+    <button type="button" class="btn btn-outline btn-outline-bright" data-action="all-issues">All issues</button>
+    <div class="case-actions-end">
+      <button type="button" class="btn btn-outline btn-outline-bright" data-action="next-issue">Next issue</button>
+      <button type="button" class="btn btn-outline btn-outline-bright" data-action="full-record">View full statement</button>
+      <button type="button" class="btn primary" data-action="draft">Draft query</button>
+    </div>
+  </div>`;
+}
+
+function renderApp(): string {
+  const table = primaryTable();
+  const tid = caseTreatyId();
+  const obj = tid ? TREATIES[tid] ?? null : null;
 
   const full = state.fullRecord
     ? `<div class="full-record" data-action="close-full">
         <div class="full-record-card" data-stop>
           <h2>${esc(obj?.label ?? 'Record')}</h2>
           <p>Canonical host for this data object — same tabs and tables, full chrome.</p>
-          <button type="button" class="btn primary" data-action="close-full">Back to case desk</button>
+          <button type="button" class="btn primary" data-action="close-full">Back to desk</button>
         </div>
       </div>`
     : '';
@@ -1396,43 +1982,63 @@ function renderCase(): string {
     <main class="case-body">
       <div class="desk-stage">
         <section class="desk" aria-label="Desk">
-          <div class="desk-rail-head">
-            <button type="button" class="all-issues" data-action="home">← All issues</button>
-          </div>
           <div class="desk-scroll">
-            <div class="case-banner">
-              <span class="kind">${esc(KIND_LABEL[item.kind] || 'Case')}</span>
-              <div class="case-banner-copy">
-                <h2>${esc(item.title)}</h2>
-                <span class="meta">${esc(item.detail)}</span>
-              </div>
-            </div>
-            ${renderDesk()}
-            ${draft}
+            ${renderDeskSurface()}
           </div>
-          <div class="case-actions">
-            <button type="button" class="btn primary" data-action="draft">Draft query</button>
-            <button type="button" class="btn" data-action="full-record">View full statement</button>
-            <button type="button" class="btn" data-action="save">${state.saved ? 'Saved' : 'Save case'}</button>
-          </div>
+          ${renderCaseActions()}
         </section>
       </div>
     </main>
     ${renderThread()}
+    ${renderDrawerDropdown()}
     ${modals}
     ${full}
+    ${renderToast()}
   </div>`;
 }
+
 function render(): void {
-  app.innerHTML = state.screen === 'home' ? renderHome() : renderCase();
+  app.innerHTML = renderApp();
   bind();
+  if (pendingDeskScroll && state.deskMode === 'focus') {
+    pendingDeskScroll = false;
+    scrollDeskToLatest();
+  }
 }
 
 function bind(): void {
   app.querySelectorAll<HTMLButtonElement>('[data-open]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const item = ATTENTION.find((a) => a.id === btn.dataset.open);
-      if (item) openCase(item);
+      if (item) {
+        state.drawerOpen = false;
+        focusIssue(item);
+      }
+    });
+  });
+
+  app.querySelectorAll<HTMLInputElement>('[data-drawer-select]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = input.dataset.drawerSelect!;
+      if (input.checked) {
+        if (!state.drawerSelected.includes(id)) state.drawerSelected = [...state.drawerSelected, id];
+      } else {
+        state.drawerSelected = state.drawerSelected.filter((x) => x !== id);
+      }
+      render();
+    });
+  });
+
+  app.querySelectorAll<HTMLInputElement>('[data-drawer-from]').forEach((input) => {
+    input.addEventListener('change', () => {
+      state.drawerCustomFrom = input.value;
+      render();
+    });
+  });
+  app.querySelectorAll<HTMLInputElement>('[data-drawer-to]').forEach((input) => {
+    input.addEventListener('change', () => {
+      state.drawerCustomTo = input.value;
+      render();
     });
   });
 
@@ -1502,7 +2108,54 @@ function bind(): void {
         render();
         return;
       }
-      if (action === 'home') closeCase();
+      if (action === 'all-issues' || action === 'home') {
+        showRoster();
+        return;
+      }
+      if (action === 'next-issue') {
+        focusNextIssue();
+        return;
+      }
+      if (action === 'toggle-drawer') {
+        state.drawerOpen = !state.drawerOpen;
+        if (!state.drawerOpen) state.drawerSelected = [];
+        render();
+        return;
+      }
+      if (action === 'close-drawer') {
+        state.drawerOpen = false;
+        state.drawerSelected = [];
+        render();
+        return;
+      }
+      if (action === 'drawer-range') {
+        const range = el.dataset.range as DrawerRange;
+        if (range) state.drawerRange = range;
+        render();
+        return;
+      }
+      if (action === 'drawer-select-all') {
+        const visible = filteredDrawerClusters();
+        const allOn = visible.every((c) => state.drawerSelected.includes(c.caseId));
+        if (allOn) {
+          const drop = new Set(visible.map((c) => c.caseId));
+          state.drawerSelected = state.drawerSelected.filter((id) => !drop.has(id));
+        } else {
+          const merge = new Set([...state.drawerSelected, ...visible.map((c) => c.caseId)]);
+          state.drawerSelected = [...merge];
+        }
+        render();
+        return;
+      }
+      if (action === 'drawer-clear-selected') {
+        clearSelectedDrawerClusters();
+        return;
+      }
+      if (action === 'drawer-remove') {
+        const id = el.dataset.caseId;
+        if (id) removeDrawerCluster(id);
+        return;
+      }
       if (action === 'full-record') {
         state.fullRecord = true;
         render();
@@ -1513,27 +2166,42 @@ function bind(): void {
         render();
       }
       if (action === 'draft') {
+        state.demo.sawDraft = true;
         state.draftOpen = true;
+        state.draftSent = false;
+        markDeskScroll();
         render();
       }
       if (action === 'cancel-draft') {
-        state.draftOpen = false;
+        dismissDraftWidget();
+        return;
+      }
+      if (action === 'undo-dismiss') {
+        undoDismissDraft();
+        return;
+      }
+      if (action === 'review-draft') {
+        state.draftSent = false;
         render();
+        const ta = app.querySelector<HTMLTextAreaElement>('[data-draft-body]');
+        ta?.focus();
+        return;
       }
       if (action === 'send-draft') {
-        state.draftOpen = false;
+        const ta = app.querySelector<HTMLTextAreaElement>('[data-draft-body]');
+        if (ta) state.draftBody = ta.value;
+        state.demo.sawDraft = true;
+        state.draftOpen = true;
+        state.draftSent = true;
         state.messages = [
           ...state.messages,
           msg('user', 'Sent the query draft.'),
           msg(
             'agent',
-            'Marked under query. The case stays on the desk until a corrected statement re-lands, or you resolve with an outcome.',
+            'Query sent — marked under query.',
           ),
         ];
-        render();
-      }
-      if (action === 'save') {
-        state.saved = true;
+        markDeskScroll();
         render();
       }
       if (action === 'section' && el instanceof HTMLSelectElement) {
@@ -1704,7 +2372,7 @@ function bind(): void {
     });
   });
 
-  app.querySelectorAll<HTMLButtonElement>('.readout-chip[data-chip-msg]').forEach((btn) => {
+  app.querySelectorAll<HTMLButtonElement>('[data-chip-msg]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const mi = Number(btn.dataset.chipMsg);
@@ -1724,9 +2392,12 @@ function bind(): void {
       const mi = Number(btn.dataset.chipMsg);
       const pi = Number(btn.dataset.chipPart);
       const part = state.messages[mi]?.parts[pi];
-      if (part?.type === 'chip' && part.apply) applyDeskOp(part.apply);
-      else state.chipMenu = null;
-      render();
+      if ((part?.type === 'chip' || part?.type === 'calc') && part.apply) {
+        applyDeskOp(part.apply);
+      } else {
+        state.chipMenu = null;
+        render();
+      }
     });
   });
 

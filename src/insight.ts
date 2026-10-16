@@ -45,6 +45,8 @@ export type CalcPart =
 
 export interface CalculationBlock {
   type: 'calculation';
+  /** `row` = Due ÷ ITD = Share. `sum` = stacked addends → total (PDF residual metrics-1). */
+  layout?: 'row' | 'sum';
   parts: CalcPart[];
 }
 
@@ -142,7 +144,7 @@ const DEFAULT_OPS: InsightOpType[] = [
   'draft-from-narrative',
 ];
 
-function residualCalc(due: string, itd: string, share: string): CalculationBlock {
+export function residualCalc(due: string, itd: string, share: string): CalculationBlock {
   return {
     type: 'calculation',
     parts: [
@@ -156,6 +158,32 @@ function residualCalc(due: string, itd: string, share: string): CalculationBlock
       },
       { kind: 'op', symbol: '=' },
       { kind: 'term', label: 'Share', value: share, role: 'output' },
+    ],
+  };
+}
+
+/** Canonical TOR residual equation — shared by chat readout and desk pin. */
+export function residualTorCalculation(): CalculationBlock {
+  return residualCalc('€40K', '€1.24M', '3.2%');
+}
+
+/** Vertical ITD rollup — gallery / optional chat (Residual metrics-1.pdf). */
+export function residualItdSumCalculation(count = 5, each = '€1.24M', total = '6.20M'): CalculationBlock {
+  const addends: CalcPart[] = Array.from({ length: count - 1 }, () => ({
+    kind: 'term' as const,
+    label: 'ITD',
+    value: each,
+    role: 'input' as const,
+  }));
+  return {
+    type: 'calculation',
+    layout: 'sum',
+    parts: [
+      ...addends,
+      { kind: 'op', symbol: '+' },
+      { kind: 'term', label: 'ITD', value: each, role: 'input' },
+      { kind: 'op', symbol: '=' },
+      { kind: 'term', label: 'Total ITD', value: total, role: 'output' },
     ],
   };
 }
@@ -174,7 +202,7 @@ export function residualInsightTor(): InsightWidget {
         entityId: 'tor-qs-2025',
         status: 'Open · A – EU',
         emphasis: true,
-        blocks: [residualCalc('€40K', '€1.24M', '3.2%')],
+        blocks: [residualTorCalculation()],
       },
     ],
     blocks: [],
@@ -196,7 +224,7 @@ export function residualInsightPeers(): InsightWidget {
         entityId: 'tor-qs-2025',
         status: 'Open · A – EU',
         emphasis: true,
-        blocks: [residualCalc('€40K', '€1.24M', '3.2%')],
+        blocks: [residualTorCalculation()],
       },
       {
         id: 'allianz',
@@ -285,7 +313,7 @@ export function commissionTrueUpInsight(): InsightWidget {
       {
         id: 'art',
         label: 'ART',
-        status: 'Sliding scale',
+        status: 'Sliding scale · LR 50%',
         emphasis: true,
         blocks: [
           {
@@ -298,11 +326,50 @@ export function commissionTrueUpInsight(): InsightWidget {
               { kind: 'term', label: 'Δ', value: '+0.50pp', role: 'output' },
             ],
           },
+          {
+            type: 'metrics',
+            items: [
+              { label: 'Net cash', value: '~$1.15M' },
+              { label: 'Basis', value: 'Sliding scale' },
+              { label: 'As of', value: 'Q1 2026' },
+            ],
+          },
         ],
       },
     ],
     blocks: [],
     ops: DEFAULT_OPS,
+  };
+}
+
+/** RVI chase — statement still outstanding past expected date. */
+export function statementOverdueInsight(): InsightWidget {
+  return {
+    id: 'insight-rvi-overdue',
+    kind: 'insight',
+    title: 'Statement overdue',
+    scope: 'Q1 2026',
+    layout: 'stack',
+    subjects: [
+      {
+        id: 'rvi',
+        label: 'RVI',
+        status: '18 days overdue',
+        emphasis: true,
+        blocks: [
+          {
+            type: 'metrics',
+            items: [
+              { label: 'Expected', value: '28 May 2026' },
+              { label: 'Overdue', value: '18 days' },
+              { label: 'Status', value: 'Not received' },
+            ],
+          },
+        ],
+      },
+    ],
+    blocks: [],
+    ops: ['remove', 'draft-from-narrative', 'reveal-source'],
   };
 }
 

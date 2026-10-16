@@ -1,6 +1,6 @@
 import './style.css';
 import './gallery.css';
-import { renderReadoutChip, renderReadoutChipInBubble } from './chip-render.ts';
+import { renderCalcChip, renderCalcChipInBubble, renderReadoutChip } from './chip-render.ts';
 import {
   ATTENTION,
   TREATIES,
@@ -9,6 +9,7 @@ import {
 } from './data.ts';
 import {
   cloneViewForTab,
+  createSectionObject,
   createTableObject,
   type TableDeskObject,
 } from './desk.ts';
@@ -19,11 +20,14 @@ import {
   residualInsightMetrics,
   residualInsightPeers,
   residualInsightTor,
+  residualItdSumCalculation,
+  residualTorCalculation,
   type InsightWidget,
 } from './insight.ts';
 import { renderInsightWidget } from './insight-render.ts';
 import { renderAttentionCard } from './issue-render.ts';
 import { renderObjectWidget } from './object-render.ts';
+import { renderSectionObject } from './section-render.ts';
 import { esc } from './util.ts';
 
 type GallerySectionId = 'issue' | 'object' | 'insight' | 'chip';
@@ -112,12 +116,39 @@ const SECTIONS: GallerySection[] = [
   {
     id: 'object',
     label: 'Object',
-    lead: 'Entity-tethered table card — tabs, filters, empty recovery, split panes.',
+    lead: 'Entity-tethered cards — section focus (light) or treaty table (collection).',
     stories: [
       {
+        id: 'object-section-focus',
+        title: 'Section focus',
+        blurb: 'Case pin — treaty becomes tags; measures as a strip.',
+        html: (() => {
+          const sectionObj = createSectionObject('tor-qs-2025', 'A - EU', {
+            highlightDue: true,
+          });
+          const row = TOR.sections.find((r) => r.section === 'A - EU')!;
+          return renderSectionObject(sectionObj, TOR, row);
+        })(),
+      },
+      {
+        id: 'object-section-and-table',
+        title: 'Section + treaty table',
+        blurb: 'Scope check — case card kept, collection added underneath.',
+        html: (() => {
+          const sectionObj = createSectionObject('tor-qs-2025', 'A - EU', {
+            highlightDue: true,
+          });
+          const row = TOR.sections.find((r) => r.section === 'A - EU')!;
+          return `<div class="desk-composition" style="display:flex;flex-direction:column;gap:1rem">
+            ${renderSectionObject(sectionObj, TOR, row)}
+            ${renderObjectStory(objectSections())}
+          </div>`;
+        })(),
+      },
+      {
         id: 'object-sections',
-        title: 'Sections · residual highlight',
-        blurb: 'Default TOR projection — full chrome, Due emphasized.',
+        title: 'Treaty · sections table',
+        blurb: 'Collection frame alone — full chrome, Due emphasized.',
         html: renderObjectStory(objectSections()),
       },
       {
@@ -192,34 +223,52 @@ const SECTIONS: GallerySection[] = [
   {
     id: 'chip',
     label: 'Readout chip',
-    lead: 'Chat answer that can be pinned to the desk via Add to desk.',
+    lead: 'Chat calculation chip — pin to the desk via Add to desk.',
     stories: [
       {
-        id: 'chip-closed',
-        title: 'Default',
-        blurb: 'Residual % readout in an agent bubble.',
+        id: 'chip-residual',
+        title: 'Residual metrics',
+        blurb: 'Due ÷ ITD = Share — single chip, no separate summary.',
         html: `<div class="gallery-chat">
-          ${renderReadoutChipInBubble('Due is highlighted on A – EU.', {
-            label: 'Residual / section ITD',
-            value: '3.2%',
-          })}
+          ${renderCalcChipInBubble(
+            'Material enough to chase (tolerance €1).',
+            residualTorCalculation(),
+          )}
         </div>`,
       },
       {
-        id: 'chip-menu',
+        id: 'chip-residual-menu',
         title: 'Menu open',
-        blurb: 'Add to desk affordance.',
+        blurb: 'Add to desk from the calculation chip.',
         html: `<div class="gallery-chat">
-          ${renderReadoutChipInBubble('Open the readout to pin Residual / ITD on the desk.', {
-            label: 'Residual / section ITD',
-            value: '3.2%',
-          }, { menuOpen: true })}
+          ${renderCalcChipInBubble(
+            'Residual / ITD for Torgus on A – EU.',
+            residualTorCalculation(),
+            { menuOpen: true },
+          )}
         </div>`,
       },
       {
         id: 'chip-alone',
         title: 'Chip only',
         blurb: 'Without bubble chrome.',
+        html: renderCalcChip(residualTorCalculation()),
+      },
+      {
+        id: 'chip-itd-sum',
+        title: 'ITD sum',
+        blurb: 'Stacked addends → Total ITD (Residual metrics-1).',
+        html: `<div class="gallery-chat">
+          ${renderCalcChipInBubble(
+            'Section ITD across the five open lines rolls up to 6.20M.',
+            residualItdSumCalculation(),
+          )}
+        </div>`,
+      },
+      {
+        id: 'chip-filter',
+        title: 'Simple value chip',
+        blurb: 'Label + value for filters and short facts.',
         html: renderReadoutChip({ label: 'Filter', value: 'LR > 10%' }),
       },
     ],

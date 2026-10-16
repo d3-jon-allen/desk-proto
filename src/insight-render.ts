@@ -29,12 +29,66 @@ function renderCalcPart(part: CalcPart): string {
   </div>`;
 }
 
+/** Stacked addends → total (value + label rows, rule before result). */
+function renderSumCalculation(
+  block: Extract<InsightBlock, { type: 'calculation' }>,
+): string {
+  const rows: string[] = [];
+  let pendingOp: string | null = null;
+  let pastEquals = false;
+
+  for (const part of block.parts) {
+    if (part.kind === 'op') {
+      if (part.symbol === '=') {
+        pastEquals = true;
+        pendingOp = '=';
+      } else {
+        pendingOp = part.symbol;
+      }
+      continue;
+    }
+    if (pastEquals) {
+      rows.push(`<div class="math-sum-rule" aria-hidden="true"></div>`);
+      rows.push(`<div class="math-sum-row math-sum-row--result">
+        <span class="math-sum-op" aria-hidden="true">${esc(pendingOp ?? '=')}</span>
+        <span class="math-sum-value">${esc(part.value)}</span>
+        <span class="math-sum-label">${esc(part.label)}</span>
+      </div>`);
+      pendingOp = null;
+      continue;
+    }
+    rows.push(`<div class="math-sum-row">
+      <span class="math-sum-op"${pendingOp ? '' : ' aria-hidden="true"'}>${
+        pendingOp ? esc(pendingOp) : ''
+      }</span>
+      <span class="math-sum-value">${esc(part.value)}</span>
+      <span class="math-sum-label">${esc(part.label)}</span>
+    </div>`);
+    pendingOp = null;
+  }
+
+  return `<div class="math-formula math-formula--sum" role="group" aria-label="Calculation">
+    ${rows.join('')}
+  </div>`;
+}
+
+/** Calculation strip — used in desk insights and in chat readouts. */
+export function renderCalculationBlock(
+  block: Extract<InsightBlock, { type: 'calculation' }>,
+  opts?: { compact?: boolean },
+): string {
+  if (block.layout === 'sum') {
+    return renderSumCalculation(block);
+  }
+  return `<div class="math-formula${opts?.compact ? ' math-formula--chat' : ''}" role="group" aria-label="Calculation">
+    ${block.parts.map(renderCalcPart).join('')}
+  </div>`;
+}
+
 function renderBlock(block: InsightBlock): string {
   switch (block.type) {
     case 'calculation':
-      return `<div class="math-formula" role="group" aria-label="Calculation">
-        ${block.parts.map(renderCalcPart).join('')}
-      </div>`;
+      return renderCalculationBlock(block);
     case 'metrics':
       return `<dl class="insight-metrics">
         ${block.items

@@ -33,11 +33,41 @@ export interface TableDeskObject {
   view: ViewState;
 }
 
-export type DeskObject = TableDeskObject | InsightWidget;
+/**
+ * Single-section focus object — treaty is context (tags), not the frame.
+ * Used when a query resolves to one section rather than the treaty collection.
+ */
+export interface SectionDeskObject {
+  id: string;
+  kind: 'section';
+  treatyId: string;
+  /** Section key as in TreatyObject.sections (e.g. "A - EU"). */
+  section: string;
+  /** Emphasize Due when the residual is in focus. */
+  highlightDue?: boolean;
+  /** Optional residual / ITD share for the measure strip. */
+  residualShare?: string;
+}
+
+export type DeskObject = TableDeskObject | SectionDeskObject | InsightWidget;
 
 /** Deterministic mutation applied from chat chips or agent intents. */
 export type DeskOp =
   | { type: 'highlight-residual'; tableId?: string }
+  | {
+      type: 'focus-section';
+      treatyId: string;
+      section: string;
+      highlightDue?: boolean;
+      residualShare?: string;
+    }
+  | {
+      type: 'add-peer-section';
+      treatyId: string;
+      section: string;
+      highlightDue?: boolean;
+      residualShare?: string;
+    }
   | { type: 'show-residual-insight'; tableId?: string; peers?: boolean }
   | { type: 'clear-filters'; tableId?: string }
   | { type: 'show-all'; tableId?: string }
@@ -60,6 +90,22 @@ export function createTableObject(
     treatyId,
     title: opts?.title,
     view: opts?.view ?? defaultViewState(treatyId),
+  };
+}
+
+export function createSectionObject(
+  treatyId: string,
+  section: string,
+  opts?: { id?: string; highlightDue?: boolean; residualShare?: string },
+): SectionDeskObject {
+  const slug = section.replace(/\s+/g, '-').toLowerCase();
+  return {
+    id: opts?.id ?? `section-${treatyId}-${slug}`,
+    kind: 'section',
+    treatyId,
+    section,
+    highlightDue: opts?.highlightDue,
+    residualShare: opts?.residualShare,
   };
 }
 
