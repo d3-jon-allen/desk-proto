@@ -6,8 +6,6 @@ export interface SectionRenderOptions {
   /** Flash / agent-touched state. */
   flash?: boolean;
   showRemove?: boolean;
-  /** Half-width when sitting beside a pinned insight. */
-  besideInsight?: boolean;
 }
 
 function displaySectionName(section: string): string {
@@ -38,12 +36,11 @@ export function renderSectionObject(
 ): string {
   const highlightDue = sectionObj.highlightDue || row.dueEmphasis;
   const flash = opts.flash ? ' agent-touched' : '';
-  const beside = opts.besideInsight ? ' is-beside' : '';
   const remove = opts.showRemove
     ? `<button type="button" class="icon-btn" data-action="request-remove" data-table-id="${esc(sectionObj.id)}" aria-label="Remove">✕</button>`
     : '';
 
-  return `<section class="section-object${flash}${beside}" data-section-id="${esc(sectionObj.id)}" data-table-id="${esc(sectionObj.id)}">
+  return `<section class="section-object${flash}" data-section-id="${esc(sectionObj.id)}" data-table-id="${esc(sectionObj.id)}">
     <div class="section-object-head">
       <div>
         <h3>Section: ${esc(displaySectionName(row.section))}</h3>

@@ -138,6 +138,9 @@ const SUGGEST_JUST_TELL = 'Don’t change the desk — just tell me the residual
 const DEFAULT_DRAFT_BODY =
   'Please review the €40,000 residual on Due for section A - EU on the Q1 2026 statement. Internal tie-out does not reconcile within tolerance (€1). Kindly confirm or provide a corrected bordereaux.';
 
+const RVI_CHASE_DRAFT_BODY =
+  'RVI Q1 2026 statement was due 28 May 2026 and remains outstanding (18 days overdue). Please confirm the expected delivery date, or advise if a revised bordereaux lag applies.';
+
 function msg(role: Message['role'], text: string, extras: MessagePart[] = []): Message {
   return { role, parts: [{ type: 'text', text }, ...extras] };
 }
@@ -182,10 +185,7 @@ const state: AppState = {
   layout: 'stack',
   focusTableId: null,
   messages: [
-    msg(
-      'agent',
-      'Here are the items that need your attention today. Open one to clear the others into the drawer — chat stays with you.',
-    ),
+    msg('agent', 'Here are the items that need your attention today.'),
   ],
   draftOpen: false,
   draftSent: false,
@@ -198,7 +198,7 @@ const state: AppState = {
   settingsQuery: '',
   settingsSearchOpen: false,
   pendingRemoveId: null,
-  chatCollapsed: false,
+  chatCollapsed: true,
   homeSort: 'urgency',
   chipMenu: null,
   toast: null,
@@ -637,12 +637,66 @@ function showRoster(opts?: { quiet?: boolean }): void {
       msg(
         'agent',
         state.drawer.length > 0
-          ? `Roster’s back on the desk. ${state.drawer.length} issue${state.drawer.length === 1 ? '' : 's'} parked in the drawer — pull one up anytime.`
-          : 'Roster’s back on the desk. Open an issue to focus — siblings go into the drawer.',
+          ? `Back to the open issues. ${state.drawer.length} parked from earlier work.`
+          : 'Back to the open issues.',
       ),
     ];
   }
   render();
+}
+
+function seedArtCommissionTable(): TableDeskObject {
+  const base = defaultViewState('art-qs-2025');
+  const enabledViews = new Set(base.enabledViews);
+  enabledViews.add('signed-lines');
+  enabledViews.add('contracts');
+  const view: ViewState = {
+    ...base,
+    tab: 'signed-lines',
+    section: null,
+    highlightDue: false,
+    enabledViews,
+    exploredPeers: false,
+  };
+  return createTableObject('art-qs-2025', {
+    id: 'table-art-commission',
+    view,
+  });
+}
+
+function seedFreshFocus(item: AttentionItem): string {
+  state.layout = 'stack';
+  state.focusTableId = null;
+  state.draftSent = false;
+  state.demo = emptyDemo();
+
+  if (item.id === 'rvi-chase') {
+    state.desk = [];
+    state.draftOpen = true;
+    state.draftBody = RVI_CHASE_DRAFT_BODY;
+    return 'RVI statement is 18 days overdue. Draft chase ready.';
+  }
+
+  if (item.id === 'art-review') {
+    const table = seedArtCommissionTable();
+    state.desk = [table];
+    state.focusTableId = table.id;
+    state.draftOpen = false;
+    state.draftBody = DEFAULT_DRAFT_BODY;
+    return 'ART commission true-up on the signed-line object — 43.70% → 44.20% at 50% LR (~$1.15M).';
+  }
+
+  if (item.objectId) {
+    state.desk = [createSectionObject(item.objectId, 'A - EU', { highlightDue: true })];
+    state.draftOpen = false;
+    state.draftBody = DEFAULT_DRAFT_BODY;
+    return 'Opened on section A – EU. Tie-out break sits on Due.';
+  }
+
+  state.desk = [];
+  state.draftOpen = false;
+  state.draftBody = DEFAULT_DRAFT_BODY;
+  return `Opened “${item.title}”. No projected desk object yet in this prototype.`;
 }
 
 function applyFreshFocus(item: AttentionItem, opts?: { announce?: string }): void {
@@ -651,7 +705,7 @@ function applyFreshFocus(item: AttentionItem, opts?: { announce?: string }): voi
   state.fullRecord = false;
   state.flash = null;
   state.modal = null;
-  state.settingsFocus = 'sections';
+  state.settingsFocus = item.id === 'art-review' ? 'signed-lines' : 'sections';
   state.settingsQuery = '';
   state.settingsSearchOpen = false;
   state.pendingRemoveId = null;
@@ -659,46 +713,22 @@ function applyFreshFocus(item: AttentionItem, opts?: { announce?: string }): voi
   state.draftUndo = null;
   state.drawerOpen = false;
 
-  let announce =
-    opts?.announce ??
-    null;
+  const parked = state.drawer.find((c) => c.caseId === item.id);
+  let announce = opts?.announce ?? null;
 
-  if (!item.objectId) {
-    state.desk = [];
-    state.focusTableId = null;
-    state.layout = 'stack';
-    state.draftOpen = false;
-    state.draftSent = false;
-    state.draftBody = DEFAULT_DRAFT_BODY;
-    state.demo = emptyDemo();
-    announce =
-      announce ??
-      `I can open ${item.title.split(' ')[0]} as a case, but this prototype only projects a display object for TOR. Try the resolve item — or ask for all open issues.`;
+  if (parked) {
+    state.desk = structuredClone(parked.desk);
+    state.layout = parked.layout;
+    state.focusTableId = parked.focusTableId;
+    state.draftOpen = parked.draftOpen;
+    state.draftSent = parked.draftSent;
+    state.draftBody = parked.draftBody;
+    state.demo = { ...parked.demo };
+    announce = announce ?? `Back on “${item.title}”.`;
+    markDeskScroll();
   } else {
-    const parked = state.drawer.find((c) => c.caseId === item.id);
-    if (parked) {
-      state.desk = structuredClone(parked.desk);
-      state.layout = parked.layout;
-      state.focusTableId = parked.focusTableId;
-      state.draftOpen = parked.draftOpen;
-      state.draftSent = parked.draftSent;
-      state.draftBody = parked.draftBody;
-      state.demo = { ...parked.demo };
-      announce = announce ?? `Pulled “${item.title}” back from the drawer.`;
-      markDeskScroll();
-    } else {
-      const sectionObj = createSectionObject(item.objectId, 'A - EU', { highlightDue: true });
-      state.desk = [sectionObj];
-      state.layout = 'stack';
-      state.focusTableId = null;
-      state.draftOpen = false;
-      state.draftSent = false;
-      state.draftBody = DEFAULT_DRAFT_BODY;
-      state.demo = emptyDemo();
-      announce =
-        announce ??
-        'Opened on section A – EU. Tie-out break sits on Due — check whether the residual is material, then ask for more context on this.';
-    }
+    const seeded = seedFreshFocus(item);
+    announce = announce ?? seeded;
   }
 
   if (announce) state.messages = [...state.messages, msg('agent', announce)];
@@ -735,9 +765,7 @@ function focusNextIssue(): void {
   }
   parkCurrentCluster();
   applyFreshFocus(next, {
-    announce: next.objectId
-      ? `Next up: ${next.title}. Prior work is in the drawer.`
-      : `Next up: ${next.title}. No projected desk object in this prototype — try TOR, or ask for all open issues.`,
+    announce: `Next up: ${next.title}.`,
   });
   render();
 }
@@ -936,10 +964,7 @@ function agentReply(userTextIn: string): void {
   if (state.deskMode === 'roster') {
     state.messages = [
       ...state.messages,
-      msg(
-        'agent',
-        'Pick an issue on the desk, or ask me to open the TOR resolve item.',
-      ),
+      msg('agent', 'Open an issue from the list, or say which one you want.'),
     ];
     render();
     return;
@@ -950,10 +975,7 @@ function agentReply(userTextIn: string): void {
   if (!tid || !TREATIES[tid]) {
     state.messages = [
       ...state.messages,
-      msg(
-        'agent',
-        'This issue has no projected display object yet. Ask for all open issues, or open the TOR resolve item.',
-      ),
+      msg('agent', 'This issue has no projected display object yet.'),
     ];
     render();
     return;
@@ -993,7 +1015,7 @@ function agentReply(userTextIn: string): void {
       ...state.messages,
       msg(
         'agent',
-        'Material enough to chase (tolerance €1). Pin the calculation beside the section when you’re ready.',
+        'Material enough to chase (tolerance €1).',
         [residualCalcPart],
       ),
     ];
@@ -1083,10 +1105,7 @@ function agentReply(userTextIn: string): void {
     state.draftSent = false;
     state.messages = [
       ...state.messages,
-      msg(
-        'agent',
-        'Draft is open under the desk — edit if needed, then send. When you’re done, ask for all open issues or next issue — work parks in the drawer automatically.',
-      ),
+      msg('agent', 'Draft is ready — edit if needed, then send.'),
     ];
     markDeskScroll();
     render();
@@ -1102,10 +1121,7 @@ function agentReply(userTextIn: string): void {
 
   state.messages = [
     ...state.messages,
-    msg(
-      'agent',
-      'Try a suggestion — residual %, more context on this, draft a query, or show all open issues.',
-    ),
+    msg('agent', 'Not sure what you need on this one — try one of the suggestions below.'),
   ];
   render();
 }
@@ -1118,12 +1134,23 @@ function sendCompose(): void {
 }
 
 function renderTopnav(): string {
+  const drawerCount = state.drawer.length;
+  const chatLabel = state.chatCollapsed ? 'Expand chat' : 'Collapse chat';
   return `<nav class="topnav">
     <a href="/gallery.html">Gallery</a>
     <a href="#">Marketplace</a>
     <a href="#">Community</a>
     <a href="#">Ask AI</a>
     <div class="avatars"><span class="avatar"></span><span class="avatar"></span></div>
+    <div class="topnav-tools">
+      <button type="button" class="icon-btn drawer-toggle${state.drawerOpen ? ' is-open' : ''}${drawerCount > 0 ? ' has-items' : ''}" data-action="toggle-drawer" aria-expanded="${state.drawerOpen}" aria-haspopup="dialog" aria-label="Drawer${drawerCount > 0 ? `, ${drawerCount} items` : ''}" title="Drawer">
+        ${iconDrawer()}
+        ${drawerCount > 0 ? `<span class="drawer-count">${drawerCount}</span>` : ''}
+      </button>
+      <button type="button" class="icon-btn chat-rail-btn${state.chatCollapsed ? '' : ' is-open'}" data-action="${state.chatCollapsed ? 'expand-chat' : 'collapse-chat'}" aria-label="${esc(chatLabel)}" title="${esc(chatLabel)}">
+        ${iconPanelSidebar()}
+      </button>
+    </div>
   </nav>`;
 }
 
@@ -1198,6 +1225,8 @@ function renderDrawerDropdown(): string {
       : visible
           .map((c) => {
             const checked = state.drawerSelected.includes(c.caseId);
+            const widgetCount = c.desk.length + (c.draftOpen ? 1 : 0);
+            const draftNote = c.draftOpen && c.desk.length > 0 ? ' · draft' : '';
             return `<div class="drawer-row">
               <label class="drawer-check">
                 <input type="checkbox" data-drawer-select="${esc(c.caseId)}" ${checked ? 'checked' : ''} />
@@ -1206,7 +1235,7 @@ function renderDrawerDropdown(): string {
               <button type="button" class="drawer-open" data-open="${esc(c.caseId)}">
                 <span class="kind">${esc(KIND_LABEL[c.kind] || 'Case')}</span>
                 <span class="drawer-title">${esc(c.title)}</span>
-                <span class="drawer-meta">${c.desk.length} widget${c.desk.length === 1 ? '' : 's'}${c.draftOpen ? ' · draft' : ''}</span>
+                <span class="drawer-meta">${widgetCount} widget${widgetCount === 1 ? '' : 's'}${draftNote}</span>
               </button>
             </div>`;
           })
@@ -1227,7 +1256,10 @@ function renderDrawerDropdown(): string {
 
   return `<div class="drawer-backdrop" data-action="close-drawer" aria-hidden="true"></div>
     <div class="drawer-dropdown" role="dialog" aria-label="Drawer" data-stop>
-      <div class="drawer-ranges" role="tablist">${rangeTabs}</div>
+      <div class="drawer-head">
+        <div class="drawer-ranges" role="tablist">${rangeTabs}</div>
+        <button type="button" class="icon-btn drawer-close" data-action="close-drawer" aria-label="Close drawer">✕</button>
+      </div>
       ${custom}
       <div class="drawer-list">${rows}</div>
       ${bulk}
@@ -1715,10 +1747,7 @@ function residualInsightOnDesk(): InsightDeskObject | null {
   );
 }
 
-function renderSectionDeskObject(
-  sectionObj: SectionDeskObject,
-  opts?: { besideInsight?: boolean },
-): string {
+function renderSectionDeskObject(sectionObj: SectionDeskObject): string {
   const treaty = TREATIES[sectionObj.treatyId];
   if (!treaty) {
     return `<section class="section-object"><p class="residual">Unknown treaty.</p></section>`;
@@ -1730,7 +1759,6 @@ function renderSectionDeskObject(
   return renderSectionObject(sectionObj, treaty, row, {
     flash: state.flash === 'residual',
     showRemove: true,
-    besideInsight: opts?.besideInsight,
   });
 }
 
@@ -1745,9 +1773,7 @@ function renderDeskObject(o: DeskObject): string {
 }
 
 function renderDesk(): string {
-  if (state.desk.length === 0) {
-    return `<section class="display-object"><p class="residual">No projected display object for this item in the prototype.</p></section>`;
-  }
+  if (state.desk.length === 0) return '';
   const sections = sectionObjects();
   const residual = residualInsightOnDesk();
   const otherInsights = state.desk.filter(
@@ -1758,27 +1784,15 @@ function renderDesk(): string {
   );
   const panes = state.desk.filter((o): o is TableDeskObject => o.kind === 'table' && !!o.title);
 
-  let focusHtml = '';
-  if (sections.length === 1 && residual) {
-    focusHtml = `<div class="desk-split-row desk-split-row--focus">
-      ${renderSectionDeskObject(sections[0]!, { besideInsight: true })}
-      ${renderInsightWidget(residual, {
-        flash: state.flash === 'residual',
-        showRemove: true,
-        interactiveLinks: true,
-      })}
-    </div>`;
-  } else {
-    focusHtml =
-      sections.map((s) => renderSectionDeskObject(s)).join('') +
-      (residual
-        ? renderInsightWidget(residual, {
-            flash: state.flash === 'residual',
-            showRemove: true,
-            interactiveLinks: true,
-          })
-        : '');
-  }
+  const focusHtml =
+    sections.map((s) => renderSectionDeskObject(s)).join('') +
+    (residual
+      ? renderInsightWidget(residual, {
+          flash: state.flash === 'residual',
+          showRemove: true,
+          interactiveLinks: true,
+        })
+      : '');
 
   const insightsHtml = otherInsights.map((o) => renderDeskObject(o)).join('');
   const tablesHtml = primaryTables.map((o) => renderTableObject(o)).join('');
@@ -1872,13 +1886,7 @@ function renderToast(): string {
 }
 
 function renderThread(): string {
-  if (state.chatCollapsed) {
-    return `<aside class="chat chat--collapsed" aria-label="Chat collapsed">
-      <button type="button" class="icon-btn chat-rail-btn" data-action="expand-chat" aria-label="Expand chat" title="Expand chat">
-        ${iconPanelSidebar()}
-      </button>
-    </aside>`;
-  }
+  if (state.chatCollapsed) return '';
 
   const msgs = state.messages.map(renderMessage).join('');
   const used = new Set(
@@ -1890,11 +1898,6 @@ function renderThread(): string {
     .join('');
 
   return `<aside class="chat">
-    <div class="chat-toolbar">
-      <button type="button" class="icon-btn chat-rail-btn" data-action="collapse-chat" aria-label="Collapse chat" title="Collapse chat">
-        ${iconPanelSidebar()}
-      </button>
-    </div>
     <div class="chat-panel">
       <div class="thread-messages">${msgs}</div>
       ${suggestions ? `<div class="suggestions">${suggestions}</div>` : ''}
@@ -1915,7 +1918,7 @@ function renderDeskSurface(): string {
         <div class="date">${esc(TODAY)}</div>
       </header>
       <div class="home-lead-row">
-        <p class="home-lead">Open issues — focusing one parks the rest in the drawer.</p>
+        <p class="home-lead">Open issues</p>
         <button type="button" class="icon-btn home-sort-btn" data-action="toggle-home-sort" aria-label="${esc(sortLabel)}" title="${esc(sortLabel)}">
           ${sortByUrgency ? iconSortUrgency() : iconSortDate()}
         </button>
@@ -1942,19 +1945,14 @@ function renderDeskSurface(): string {
 }
 
 function renderCaseActions(): string {
-  const focusActions =
-    state.deskMode === 'focus'
-      ? `<div class="case-actions-end">
-          <button type="button" class="btn btn-outline btn-outline-bright" data-action="next-issue">Next issue</button>
-          <button type="button" class="btn btn-outline btn-outline-bright" data-action="full-record">View full statement</button>
-          <button type="button" class="btn primary" data-action="draft">Draft query</button>
-        </div>`
-      : `<div class="case-actions-end"></div>`;
+  if (state.deskMode !== 'focus') return '';
   return `<div class="case-actions">
-    <button type="button" class="btn btn-outline btn-outline-bright" data-action="all-issues"${
-      state.deskMode === 'roster' ? ' disabled' : ''
-    }>All issues</button>
-    ${focusActions}
+    <button type="button" class="btn btn-outline btn-outline-bright" data-action="all-issues">All issues</button>
+    <div class="case-actions-end">
+      <button type="button" class="btn btn-outline btn-outline-bright" data-action="next-issue">Next issue</button>
+      <button type="button" class="btn btn-outline btn-outline-bright" data-action="full-record">View full statement</button>
+      <button type="button" class="btn primary" data-action="draft">Draft query</button>
+    </div>
   </div>`;
 }
 
@@ -1962,7 +1960,6 @@ function renderApp(): string {
   const table = primaryTable();
   const tid = caseTreatyId();
   const obj = tid ? TREATIES[tid] ?? null : null;
-  const drawerCount = state.drawer.length;
 
   const full = state.fullRecord
     ? `<div class="full-record" data-action="close-full">
@@ -1985,16 +1982,6 @@ function renderApp(): string {
     <main class="case-body">
       <div class="desk-stage">
         <section class="desk" aria-label="Desk">
-          <div class="desk-rail-head">
-            <span class="desk-mode-label">${state.deskMode === 'roster' ? 'Desk' : 'Focus'}</span>
-            <div class="drawer-anchor">
-              <button type="button" class="icon-btn drawer-toggle${state.drawerOpen ? ' is-open' : ''}${drawerCount > 0 ? ' has-items' : ''}" data-action="toggle-drawer" aria-expanded="${state.drawerOpen}" aria-haspopup="dialog" aria-label="Drawer${drawerCount > 0 ? `, ${drawerCount} items` : ''}" title="Drawer">
-                ${iconDrawer()}
-                ${drawerCount > 0 ? `<span class="drawer-count">${drawerCount}</span>` : ''}
-              </button>
-              ${renderDrawerDropdown()}
-            </div>
-          </div>
           <div class="desk-scroll">
             ${renderDeskSurface()}
           </div>
@@ -2003,6 +1990,7 @@ function renderApp(): string {
       </div>
     </main>
     ${renderThread()}
+    ${renderDrawerDropdown()}
     ${modals}
     ${full}
     ${renderToast()}
@@ -2210,7 +2198,7 @@ function bind(): void {
           msg('user', 'Sent the query draft.'),
           msg(
             'agent',
-            'Query sent — marked under query. The draft stays on the desk. When you’re ready, All issues or Next issue parks this cluster in the drawer.',
+            'Query sent — marked under query.',
           ),
         ];
         markDeskScroll();

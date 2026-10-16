@@ -313,7 +313,7 @@ export function commissionTrueUpInsight(): InsightWidget {
       {
         id: 'art',
         label: 'ART',
-        status: 'Sliding scale',
+        status: 'Sliding scale · LR 50%',
         emphasis: true,
         blocks: [
           {
@@ -326,11 +326,50 @@ export function commissionTrueUpInsight(): InsightWidget {
               { kind: 'term', label: 'Δ', value: '+0.50pp', role: 'output' },
             ],
           },
+          {
+            type: 'metrics',
+            items: [
+              { label: 'Net cash', value: '~$1.15M' },
+              { label: 'Basis', value: 'Sliding scale' },
+              { label: 'As of', value: 'Q1 2026' },
+            ],
+          },
         ],
       },
     ],
     blocks: [],
     ops: DEFAULT_OPS,
+  };
+}
+
+/** RVI chase — statement still outstanding past expected date. */
+export function statementOverdueInsight(): InsightWidget {
+  return {
+    id: 'insight-rvi-overdue',
+    kind: 'insight',
+    title: 'Statement overdue',
+    scope: 'Q1 2026',
+    layout: 'stack',
+    subjects: [
+      {
+        id: 'rvi',
+        label: 'RVI',
+        status: '18 days overdue',
+        emphasis: true,
+        blocks: [
+          {
+            type: 'metrics',
+            items: [
+              { label: 'Expected', value: '28 May 2026' },
+              { label: 'Overdue', value: '18 days' },
+              { label: 'Status', value: 'Not received' },
+            ],
+          },
+        ],
+      },
+    ],
+    blocks: [],
+    ops: ['remove', 'draft-from-narrative', 'reveal-source'],
   };
 }
 

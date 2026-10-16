@@ -21,6 +21,8 @@
   --case-rail-pad-top: 0.5rem;
   --case-rail-head-h: 2rem;
   --case-rail-gap: 0.75rem;
+  /* Uniform desk column for banner / cards / draft. */
+  --desk-col: 56rem;
 }
 
 *,
@@ -61,6 +63,9 @@ button {
 /* —— Shell —— */
 
 .topnav {
+  position: sticky;
+  top: 0;
+  z-index: 25;
   display: flex;
   justify-content: flex-end;
   align-items: center;
@@ -69,6 +74,14 @@ button {
   padding: 0 var(--desk-pad);
   flex-shrink: 0;
   width: 100%;
+  background: var(--bg);
+}
+
+.topnav-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: 0.35rem;
 }
 
 .topnav a {
@@ -272,17 +285,6 @@ button {
   width: 100%;
 }
 
-.desk-mode-label {
-  color: var(--muted);
-  font-size: 0.9rem;
-  font-weight: 500;
-}
-
-.drawer-anchor {
-  position: relative;
-  margin-left: auto;
-}
-
 .drawer-toggle {
   position: relative;
   color: var(--muted);
@@ -315,30 +317,45 @@ button {
   position: fixed;
   inset: 0;
   z-index: 28;
-  background: transparent;
+  background: rgba(0, 0, 0, 0.45);
 }
 
 .drawer-dropdown {
-  position: absolute;
-  top: calc(100% + 0.4rem);
-  right: 0;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   z-index: 30;
   display: flex;
   flex-direction: column;
-  gap: 0.55rem;
-  width: min(24rem, calc(100vw - 2rem));
-  max-height: min(28rem, 70vh);
-  padding: 0.7rem 0.75rem 0.75rem;
+  gap: 0.85rem;
+  width: min(48rem, calc(100vw - 2rem));
+  max-height: min(32rem, 80vh);
+  padding: 1.25rem 1.35rem 1.15rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.drawer-close {
+  flex-shrink: 0;
+  margin: -0.2rem -0.35rem 0 0;
 }
 
 .drawer-ranges {
   display: flex;
   flex-wrap: wrap;
   gap: 0.3rem;
+  flex: 1;
+  min-width: 0;
 }
 
 .drawer-range {
@@ -389,10 +406,11 @@ button {
 .drawer-list {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
+  gap: 0.55rem;
   overflow-y: auto;
   min-height: 0;
   flex: 1;
+  padding: 0.35rem 0;
 }
 
 .drawer-empty {
@@ -429,7 +447,7 @@ button {
   align-items: center;
   gap: 0.5rem;
   margin: 0;
-  padding: 0.4rem 0.5rem;
+  padding: 0.7rem 0.65rem;
   border: 1px solid transparent;
   border-radius: 0.4rem;
   background: transparent;
@@ -504,26 +522,23 @@ button {
   padding-bottom: 1rem;
 }
 
-/* Compact by default; expand when side-by-side or a wide object/table is on the desk. */
+/* Uniform desk column — banner / cards / draft share --desk-col. */
 .desk-scroll > .case-banner,
 .desk-scroll > .draft-panel,
 .desk-scroll > .desk-composition {
   width: 100%;
-  max-width: 48rem;
-}
-
-.desk-scroll > .desk-composition:has(.desk-split-row),
-.desk-scroll > .desk-composition:has(.display-object) {
-  max-width: 100%;
+  max-width: var(--desk-col);
 }
 
 .desk-roster {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 0.85rem;
+  gap: 0;
   width: 100%;
-  max-width: 40rem;
+  max-width: var(--desk-col);
+  /* 3.5rem from under topnav to greeting (stage already contributes --case-rail-pad-top). */
+  padding-top: calc(3.5rem - var(--case-rail-pad-top));
 }
 
 .desk-roster .home-lead-row,
@@ -531,8 +546,13 @@ button {
   max-width: none;
 }
 
+.desk-roster .home-lead-row {
+  margin: 0 0 0.5rem;
+}
+
 .roster-hero {
   text-align: center;
+  margin-bottom: 0.85rem;
 }
 
 .roster-hero h1 {
@@ -631,14 +651,6 @@ button {
   width: 100%;
   max-width: none;
   min-width: 0;
-}
-
-.desk-split-row--focus .section-object,
-.desk-split-row--focus .insight-object,
-.desk-split-row--focus .insight-object--single {
-  width: auto;
-  max-width: none;
-  height: 100%;
 }
 
 .section-object-head {
@@ -1061,7 +1073,7 @@ button {
 }
 
 .case-page.chat-collapsed .case-body {
-  padding-right: calc(3.25rem + var(--desk-pad));
+  padding-right: var(--desk-pad);
 }
 
 /* Insight card — values from Consolidation-exploration Figma CSS export. */
@@ -1086,10 +1098,10 @@ button {
   letter-spacing: 0;
 }
 
-/* One subject → card is half the desk column; inner panel fills the card. */
+/* Single-subject insight fills the desk column (stacked with section / table). */
 .insight-object--single {
-  width: 50%;
-  max-width: 50%;
+  width: 100%;
+  max-width: 100%;
 }
 
 .insight-object .math-head {
@@ -1868,9 +1880,9 @@ button {
   margin-left: auto;
 }
 
-.case-actions .btn:disabled {
-  opacity: 0.45;
-  cursor: default;
+.topnav .chat-rail-btn.is-open {
+  color: var(--text);
+  background: var(--surface-2);
 }
 
 .btn {
@@ -1948,7 +1960,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: var(--case-rail-gap);
-  padding: var(--case-rail-pad-top) 1rem 1rem;
+  padding: 1rem 1rem 1rem;
   z-index: 4;
   background: var(--bg);
 }

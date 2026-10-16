@@ -231,7 +231,7 @@ const SECTIONS: GallerySection[] = [
         blurb: 'Due ÷ ITD = Share — single chip, no separate summary.',
         html: `<div class="gallery-chat">
           ${renderCalcChipInBubble(
-            'Material enough to chase (tolerance €1). Pin the calculation beside the section when you’re ready.',
+            'Material enough to chase (tolerance €1).',
             residualTorCalculation(),
           )}
         </div>`,
@@ -242,7 +242,7 @@ const SECTIONS: GallerySection[] = [
         blurb: 'Add to desk from the calculation chip.',
         html: `<div class="gallery-chat">
           ${renderCalcChipInBubble(
-            'Pin Residual / ITD beside the section.',
+            'Residual / ITD for Torgus on A – EU.',
             residualTorCalculation(),
             { menuOpen: true },
           )}
