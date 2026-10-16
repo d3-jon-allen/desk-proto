@@ -3,8 +3,6 @@ name: Deploy preview
 on:
   push:
     branches: [main, 'feat/**']
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -12,7 +10,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,7 +30,6 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/'))
     runs-on: ubuntu-latest
     environment:
       name: github-pages
